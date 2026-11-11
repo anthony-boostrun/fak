@@ -302,7 +302,34 @@ func (f *File) Config() (model.Config, error) {
 		cfg.AttnOutputGate = true
 		cfg.NormGain1p = true
 		cfg.QKNorm = true
-		if cfg.FullAttentionInterval > 0 && len(cfg.LayerTypes) == 0 {
+		// The Qwen converter records the per-layer schedule explicitly as
+		// attention.recurrent_layers (true = GDN linear-attention layer) when the HF
+		// config carries layer_types; full_attention_interval is the scalar it derives
+		// from. The explicit array wins over the interval (the qwen4exp reader's
+		// precedence), must have one entry per target layer, and must agree with the
+		// interval when both are present. qwen4exp keeps its own dedicated reader.
+		if (canonArch == "qwen35" || canonArch == "qwen35moe") && f.hasKey(p+"attention.recurrent_layers") {
+			rec, ok := f.BoolArray(p + "attention.recurrent_layers")
+			if !ok || len(rec) != cfg.NumLayers {
+				return model.Config{}, fmt.Errorf("gguf: %sattention.recurrent_layers must be a %d-entry bool array", p, cfg.NumLayers)
+			}
+			cfg.LayerTypes = make([]string, cfg.NumLayers)
+			for l, r := range rec {
+				cfg.LayerTypes[l] = "full_attention"
+				if r {
+					cfg.LayerTypes[l] = "linear_attention"
+				}
+			}
+			if cfg.FullAttentionInterval > 0 {
+				for l := range rec {
+					intervalFull := (l+1)%cfg.FullAttentionInterval == 0
+					arrayFull := cfg.LayerTypes[l] == "full_attention"
+					if intervalFull != arrayFull {
+						return model.Config{}, fmt.Errorf("gguf: %sattention.recurrent_layers contradicts %sfull_attention_interval=%d at layer %d", p, p, cfg.FullAttentionInterval, l)
+					}
+				}
+			}
+		} else if cfg.FullAttentionInterval > 0 && len(cfg.LayerTypes) == 0 {
 			cfg.LayerTypes = make([]string, cfg.NumLayers)
 			for l := range cfg.LayerTypes {
 				if (l+1)%cfg.FullAttentionInterval == 0 {
@@ -325,6 +352,11 @@ func (f *File) Config() (model.Config, error) {
 	}
 	if archIsDeepSeek41(canonicalGGUFArch(arch)) {
 		if err := applyDeepSeek41Config(f, arch+".", &cfg, ropeDim); err != nil {
+			return model.Config{}, err
+		}
+	}
+	if archIsKimiK31(canonicalGGUFArch(arch)) {
+		if err := applyKimiK31Config(f, arch+".", &cfg, ropeDim); err != nil {
 			return model.Config{}, err
 		}
 	}
@@ -381,7 +413,17 @@ func canonicalGGUFArch(arch string) string {
 		// Kimi K2/K3 (Moonshot) is a scaled-up DeepSeek-V3: same MLA + DeepSeekMoE
 		// backbone, no DSA indexer, so the Moonshot-branded spellings collapse onto
 		// "deepseek2" and ride the MLA+MoE forward instead of the #934 refusal.
+		// This list is EXACT-spelling only (no prefix match), so it does not and
+		// must not capture "kimi-k31" below — K3.1's Gated-DSA layers break the
+		// no-indexer premise this alias encodes.
 		return "deepseek2"
+	case "kimi-k31", "kimi_k31":
+		// Kimi K3.1 (Moonshot): K3's hybrid stack with 24 Gated-DSA layers
+		// (sparse MLA + top-2048 learned indexer) replacing full-attention MLA,
+		// 69 KDA linear-attention layers, and one dense layer. It earns its own
+		// internal arch "kimik31" (kimik31.go) instead of riding the no-indexer
+		// deepseek2 alias above.
+		return "kimik31"
 	case "deepseek4", "deepseek-v4", "deepseek_v4", "deepseekv4", "deepseek41", "deepseek_v41", "deepseek-v41", "deepseek-v4.1", "deepseek_v41_text":
 		// DeepSeek-V4.1-Flash. llama.cpp ships a DEEPSEEK4 converter, so these are
 		// the sibling GGUF spellings of one family; all normalize onto the single
@@ -433,15 +475,16 @@ func requiredDenseFFNLen(f *File, arch, p string) (int, error) {
 // MoE-only header — one that declares expert_feed_forward_length but no dense
 // feed_forward_length — so the dense width can be derived from the expert width. This is
 // exactly the set of arches whose Config() path applies an MoE expert-axis applier
-// (applyMoEExpertCounts): the MLA+MoE family (glm_moe_dsa, deepseek2), the V4.1 family
-// (deepseek41), and the qwen MoE spellings (qwen3moe, qwen35moe, qwen2moe). A dense arch
+// (applyMoEExpertCounts or its fail-closed kimi-k31 equivalent): the MLA+MoE family
+// (glm_moe_dsa, deepseek2), the V4.1 family (deepseek41), the Kimi-K3.1 hybrid
+// (kimik31), and the qwen MoE spellings (qwen3moe, qwen35moe, qwen2moe). A dense arch
 // named here would be a bug, so the set is kept to canonical spellings only.
 func archIsMoEForDenseFFNDerive(arch string) bool {
 	if archUsesMLAMoELayout(arch) {
 		return true
 	}
 	switch arch {
-	case "deepseek41", "qwen3moe", "qwen35moe", "qwen2moe", qwen4ExpArch:
+	case "deepseek41", "kimik31", "qwen3moe", "qwen35moe", "qwen2moe", qwen4ExpArch:
 		return true
 	}
 	return false

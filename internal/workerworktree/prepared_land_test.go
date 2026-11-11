@@ -275,40 +275,46 @@ func TestPreparedLocalizedWorktreeBridge(t *testing.T) {
 
 func TestAcceptPreparedLandRejectsAlteredBindingsWithoutRefMovement(t *testing.T) {
 	tests := []struct {
-		name  string
-		alter func(*testing.T, preparedFixture, PreparedLandReceipt, *PreparedLandExpectation)
+		name       string
+		wantDetail string
+		alter      func(*testing.T, preparedFixture, PreparedLandReceipt, *PreparedLandExpectation)
 	}{
-		{"parent", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
+		{"parent", "", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
 			rewritePrepared(t, f, r, func(v *PreparedLandReceipt) { v.ParentSHA = strings.Repeat("a", 40) })
 		}},
-		{"tree", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
+		{"tree", "", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
 			rewritePrepared(t, f, r, func(v *PreparedLandReceipt) { v.TreeSHA = strings.Repeat("b", 40) })
 		}},
-		{"candidate", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
+		{"candidate", "", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
 			rewritePrepared(t, f, r, func(v *PreparedLandReceipt) { v.CandidateSHA = strings.Repeat("c", 40) })
 		}},
-		{"paths", func(_ *testing.T, _ preparedFixture, _ PreparedLandReceipt, e *PreparedLandExpectation) {
+		{"paths", "paths", func(_ *testing.T, _ preparedFixture, _ PreparedLandReceipt, e *PreparedLandExpectation) {
 			e.Paths = []string{"other.txt"}
 		}},
-		{"command", func(_ *testing.T, _ preparedFixture, _ PreparedLandReceipt, e *PreparedLandExpectation) {
+		{"command", "verification_command", func(_ *testing.T, _ preparedFixture, _ PreparedLandReceipt, e *PreparedLandExpectation) {
 			e.Verification.Command = "go test ./other"
 		}},
-		{"tags", func(_ *testing.T, _ preparedFixture, _ PreparedLandReceipt, e *PreparedLandExpectation) {
+		{"tags", "tags", func(_ *testing.T, _ preparedFixture, _ PreparedLandReceipt, e *PreparedLandExpectation) {
 			e.Verification.Tags = []string{"other"}
 		}},
-		{"contract", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
+		{"combined", "paths,verification_command,tags", func(_ *testing.T, _ preparedFixture, _ PreparedLandReceipt, e *PreparedLandExpectation) {
+			e.Paths = []string{"other.txt"}
+			e.Verification.Command = "go test ./other"
+			e.Verification.Tags = []string{"other"}
+		}},
+		{"contract", "", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
 			rewritePrepared(t, f, r, func(v *PreparedLandReceipt) { v.GateContract = "other" })
 		}},
-		{"verdict", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
+		{"verdict", "", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
 			rewritePrepared(t, f, r, func(v *PreparedLandReceipt) { v.Verdict = "FAIL" })
 		}},
-		{"recovery", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
+		{"recovery", "", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
 			rewritePrepared(t, f, r, func(v *PreparedLandReceipt) { v.RecoveryRef += "-altered" })
 		}},
-		{"missing recovery", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
+		{"missing recovery", "", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
 			mustGit(t, f.root, "update-ref", "-d", r.RecoveryRef)
 		}},
-		{"malformed", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
+		{"malformed", "", func(t *testing.T, f preparedFixture, r PreparedLandReceipt, _ *PreparedLandExpectation) {
 			path, err := PreparedLandReceiptPath(f.root, r.ReceiptID, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -332,6 +338,9 @@ func TestAcceptPreparedLandRejectsAlteredBindingsWithoutRefMovement(t *testing.T
 			got := AcceptPreparedLand(f.root, f.wt, want, nil)
 			if got.OK || got.Code != LandResultPreparedMismatch || !got.Preserved {
 				t.Fatalf("altered %s accepted: %+v", tc.name, got)
+			}
+			if tc.wantDetail != "" && got.Detail != tc.wantDetail {
+				t.Fatalf("mismatch detail = %q, want %q", got.Detail, tc.wantDetail)
 			}
 			if got.CommitSHA != "" {
 				t.Fatalf("altered %s returned commit SHA %q", tc.name, got.CommitSHA)
@@ -795,4 +804,91 @@ func TestAcceptPreparedLandResumeRejectsForeignSealedState(t *testing.T) {
 			t.Fatalf("moved target changed: %s, want %s", head, moved)
 		}
 	})
+}
+
+// TestAcceptPreparedLandAdmitsRenameCandidateCommit pins that CAS admission
+// enumerates the SAME path sides prepare recorded: a candidate commit carrying a
+// genuine rename (git mv + edit) records BOTH sides in CandidatePaths, and
+// accept must not collapse the pair through git's default rename detection.
+// Before the --no-renames fix this refused with prepared-land-mismatch /
+// "prepared candidate changed-path set mismatch".
+func TestAcceptPreparedLandAdmitsRenameCandidateCommit(t *testing.T) {
+	root := t.TempDir()
+	mustGit(t, root, "init", "-q", "-b", "main")
+	mustGit(t, root, "config", "user.email", "prepared@test.invalid")
+	mustGit(t, root, "config", "user.name", "Prepared Test")
+	mustGit(t, root, "config", "commit.gpgsign", "false")
+	// Enough shared content that the move stays above git's 50% similarity floor
+	// and rename detection genuinely fires on the candidate diff.
+	const source = "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\n"
+	if err := os.WriteFile(filepath.Join(root, "feature.txt"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "other.txt"), []byte("one\ntwo\nthree\nfour\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, root, "add", "feature.txt", "other.txt")
+	mustGit(t, root, "commit", "-q", "-m", "base")
+	base := strings.TrimSpace(mustGit(t, root, "rev-parse", "refs/heads/main"))
+
+	prep := Prepare(root, "prepared-land-rename", "prepared-land-rename", base, t.TempDir(), nil)
+	if !prep.OK {
+		t.Fatalf("prepare checkout: %+v", prep)
+	}
+	wt := prep.Path
+
+	// Genuine rename plus an independent modification of another tracked file.
+	if err := os.MkdirAll(filepath.Join(wt, "moved"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, wt, "mv", "feature.txt", filepath.Join("moved", "feature.txt"))
+	const renamedBytes = "alpha\nbravo-edited\ncharlie\ndelta\necho\nfoxtrot\n"
+	if err := os.WriteFile(filepath.Join(wt, "moved", "feature.txt"), []byte(renamedBytes), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "other.txt"), []byte("one\ntwo\nthree\nfour\nfive\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msg := filepath.Join(t.TempDir(), "message.txt")
+	if err := os.WriteFile(msg, []byte("feat(workerworktree): prepared rename candidate (fak workerworktree)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binding := ProspectiveVerificationBinding{Command: "go test ./...", Tags: []string{"unit"}}
+	paths := []string{"feature.txt", "moved/feature.txt", "other.txt"}
+	r, res := PrepareProspectiveLand(root, wt, base, msg, paths, binding,
+		func(string) (bool, string) { return true, "verified" },
+		func(string, error) Result { return Result{OK: true} }, nil)
+	if !res.OK || res.Code != LandResultPrepared {
+		t.Fatalf("prepare rename candidate: %+v", res)
+	}
+	recorded := map[string]bool{}
+	for _, p := range r.CandidatePaths {
+		recorded[p] = true
+	}
+	if !recorded["feature.txt"] || !recorded["moved/feature.txt"] || !recorded["other.txt"] {
+		t.Fatalf("prepare did not record both rename sides: %v", r.CandidatePaths)
+	}
+	// Fixture guard: without rename detection the name list must be strictly
+	// shorter than with it; otherwise this test no longer exercises the bug.
+	collapsed := strings.Fields(mustGit(t, root, "diff", "--name-only", r.ParentSHA, r.CandidateSHA))
+	expanded := strings.Fields(mustGit(t, root, "diff", "--no-renames", "--name-only", r.ParentSHA, r.CandidateSHA))
+	if len(collapsed) >= len(expanded) {
+		t.Fatalf("fixture lost its rename: collapsed=%d expanded=%d", len(collapsed), len(expanded))
+	}
+
+	got := AcceptPreparedLand(root, wt, PreparedLandExpectation{ReceiptID: r.ReceiptID, Paths: paths, Verification: binding}, nil)
+	if !got.OK || got.Code != LandResultSuccess || !got.Committed {
+		t.Fatalf("accept rename candidate: %+v", got)
+	}
+	if head := strings.TrimSpace(mustGit(t, root, "rev-parse", "refs/heads/main")); head != r.CandidateSHA {
+		t.Fatalf("head=%s candidate=%s", head, r.CandidateSHA)
+	}
+	landed, err := os.ReadFile(filepath.Join(root, "moved", "feature.txt"))
+	if err != nil || string(landed) != renamedBytes {
+		t.Fatalf("renamed file did not land exactly: bytes=%q err=%v", landed, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "feature.txt")); !os.IsNotExist(err) {
+		t.Fatalf("rename source still present after landing: %v", err)
+	}
 }

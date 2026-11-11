@@ -300,23 +300,7 @@ func (s *Session) tokenHiddenQ(id, pos int) (out []float32) {
 				return out
 			}
 		}
-		mat := matKernel(sessionQ8Kernel{s})
-		if s.Q4 && m.q4w != nil {
-			// Resident int4 decode: the Qwen3.6 hybrid (and every non-fast-PreNorm arch)
-			// runs the shared blockStep skeleton; swapping the kernel to int4 streams ~1.8×
-			// fewer weight bytes/token than Q8, raising the decode ceiling. The block
-			// orchestration (RMSNorm, RoPE, GQA, GDN recurrent scan, SwiGLU) is unchanged.
-			mat = matKernel(sessionQ4Kernel{s})
-		} else if s.Q4K && (m.q4kw != nil || len(m.kqw) > 0 || len(m.q2w) > 0) {
-			// Resident raw Q4_K decode (plan P1): same blockStep skeleton, but the q4_k_m
-			// matmul majority streams at 0.5625 B/weight (raw GGUF bytes, no round-trip) and
-			// the Q6_K minority (attn_qkv/ffn_down) falls back to the Q8 GEMV inside the kernel.
-			mat = matKernel(sessionQ4KKernel{s})
-		} else if cfg.IsMoE() {
-			// MoE routing reuses the original prepared router/expert operand after nested
-			// down-projection prep calls, so keep the allocation-safe kernel for that path.
-			mat = q8Kernel{m}
-		}
+		mat := s.tokenHiddenQKernel()
 		var x []float32
 		if m.Q2KEmbedding != nil {
 			x = make([]float32, H)
@@ -621,6 +605,45 @@ func (s *Session) attnDecodeQSA(
 	return db.scores
 }
 
+// tokenHiddenQKernel is the matKernel tokenHiddenQ hands blockStep on its non-fast path.
+// The batched resident-quant prefill lanes run an admitted MoE arch's per-row FFN on this
+// same kernel (prefillRowFFN), so the routed FFN arithmetic cannot drift from the token loop.
+func (s *Session) tokenHiddenQKernel() matKernel {
+	m := s.M
+	if s.Q4 && m.q4w != nil {
+		// Resident int4 decode: the Qwen3.6 hybrid (and every non-fast-PreNorm arch)
+		// runs the shared blockStep skeleton; swapping the kernel to int4 streams ~1.8×
+		// fewer weight bytes/token than Q8, raising the decode ceiling. The block
+		// orchestration (RMSNorm, RoPE, GQA, GDN recurrent scan, SwiGLU) is unchanged.
+		return sessionQ4Kernel{s}
+	}
+	if s.Q4K && (m.q4kw != nil || len(m.kqw) > 0 || len(m.q2w) > 0) {
+		// Resident raw Q4_K decode (plan P1): same blockStep skeleton, but the q4_k_m
+		// matmul majority streams at 0.5625 B/weight (raw GGUF bytes, no round-trip) and
+		// the Q6_K minority (attn_qkv/ffn_down) falls back to the Q8 GEMV inside the kernel.
+		return sessionQ4KKernel{s}
+	}
+	if m.Cfg.IsMoE() {
+		// MoE routing reuses the original prepared router/expert operand after nested
+		// down-projection prep calls, so keep the allocation-safe kernel for that path.
+		return q8Kernel{m}
+	}
+	return sessionQ8Kernel{s}
+}
+
+// q8AttnProj returns layer l's Q8 attention projections. Dense arches read the prebuilt
+// q8layers cache; an MoE model has no dense mlp.* tensors, so initQ8CacheIfComplete never
+// builds that cache and the projections come from m.q8 by name, the same lookup the token
+// loop's q8Kernel.mul performs.
+func (m *Model) q8AttnProj(l int) (q, k, v, o *q8Tensor) {
+	if l >= 0 && l < len(m.q8layers) {
+		ql := &m.q8layers[l]
+		return ql.qProj, ql.kProj, ql.vProj, ql.oProj
+	}
+	return m.q8(layerName(l, "self_attn.q_proj.weight")), m.q8(layerName(l, "self_attn.k_proj.weight")),
+		m.q8(layerName(l, "self_attn.v_proj.weight")), m.q8(layerName(l, "self_attn.o_proj.weight"))
+}
+
 // q8PrefillOProjDstObserver is an optional test hook called before self_attn.o_proj
 // GEMM in prefillBatchedQ, allowing unit tests to witness destination buffer reuse.
 var q8PrefillOProjDstObserver func(layer int, dst []float32)
@@ -707,10 +730,18 @@ func (s *Session) prefillBatchedQ(ids []int) []float32 {
 	// Attention and projection consumers finish before the next layer reuses this panel.
 	attnOut := make([]float32, P*nH*hd)
 	// GEMM fully overwrites these separate panels; all consumers finish before reuse.
+	// prefillBatchedMoEOK admits MoE here: its attention is batched like the dense arch,
+	// while each row's routed FFN runs through prefillRowFFN on q8Kernel, the kernel
+	// tokenHiddenQ hands blockStep for MoE. MoE has no dense mlp.* tensors, so it has no
+	// q8layers cache and no dense G/U/Down panels.
+	moe := cfg.IsMoE()
 	I := cfg.IntermediateSize
-	G := make([]float32, P*I)
-	U := make([]float32, P*I)
-	Down := make([]float32, P*H)
+	var G, U, Down []float32
+	if !moe {
+		G = make([]float32, P*I)
+		U = make([]float32, P*I)
+		Down = make([]float32, P*H)
+	}
 	// Output projection overwrites every cell; residual addition finishes before reuse.
 	O := make([]float32, P*H)
 	// Cache appends copy K/V; synchronous attention consumes Q before reuse.
@@ -719,7 +750,7 @@ func (s *Session) prefillBatchedQ(ids []int) []float32 {
 	V := make([]float32, P*w)
 	for l := 0; l < cfg.NumLayers; l++ {
 		lp := func(str string) string { return layerName(l, str) }
-		ql := m.q8Layer(l)
+		qProj, kProj, vProj, oProj := m.q8AttnProj(l)
 
 		// q8PrefillNeedsTokenLoop (kv.go:825) has no LayerNorm term, so a quantized PreNorm
 		// LayerNorm family prefills HERE while decoding through the bias-aware blockStep. The
@@ -729,9 +760,14 @@ func (s *Session) prefillBatchedQ(ids []int) []float32 {
 			wIn := m.tensor(lp("input_layernorm.weight"))
 			bIn := m.tensorOptional(lp("input_layernorm.bias"))
 			for t := lo; t < hi; t++ {
-				if cfg.NormGain1p || cfg.LayerNorm {
+				switch {
+				case cfg.NormGain1p || cfg.LayerNorm:
 					copy(Xn[t*H:(t+1)*H], normCfg(X[t*H:(t+1)*H], wIn, bIn, eps, cfg))
-				} else {
+				case moe:
+					// The MoE token loop is blockStep (serial normCfg), not the fdot fast
+					// decode the dense lane matches, so take its serial reduction here.
+					prefillNormIntoDisjoint(Xn[t*H:(t+1)*H], X[t*H:(t+1)*H], wIn, bIn, eps, cfg)
+				default:
 					rmsnormInto(Xn[t*H:(t+1)*H], X[t*H:(t+1)*H], wIn, eps)
 				}
 			}
@@ -741,8 +777,8 @@ func (s *Session) prefillBatchedQ(ids []int) []float32 {
 		// Eligible CPU groups share one worker launch; the existing dispatcher
 		// retains per-weight fallback for every other tier, mode and panel size.
 		tGroup := tic()
-		qGemm8IntoMany(Xnq, qgemm8Target{qt: ql.qProj, Y: Q},
-			qgemm8Target{qt: ql.kProj, Y: K}, qgemm8Target{qt: ql.vProj, Y: V})
+		qGemm8IntoMany(Xnq, qgemm8Target{qt: qProj, Y: Q},
+			qgemm8Target{qt: kProj, Y: K}, qgemm8Target{qt: vProj, Y: V})
 		toc(&tGemm, tGroup)
 		for t := 0; t < P; t++ {
 			m.applyProjBias(l, Q[t*nH*hd:(t+1)*nH*hd], K[t*w:(t+1)*w], V[t*w:(t+1)*w])
@@ -771,7 +807,7 @@ func (s *Session) prefillBatchedQ(ids []int) []float32 {
 		if q8PrefillOProjDstObserver != nil {
 			q8PrefillOProjDstObserver(l, O)
 		}
-		gemmInto(ql.oProj, qz(attnOut, P, nH*hd), O)
+		gemmInto(oProj, qz(attnOut, P, nH*hd), O)
 		for t := 0; t < P; t++ {
 			m.addBiasIfPresent(O[t*H:(t+1)*H], lp("self_attn.o_proj.bias"))
 		}
@@ -781,6 +817,12 @@ func (s *Session) prefillBatchedQ(ids []int) []float32 {
 			}
 		})
 
+		if moe {
+			m.prefillRowFFN(l, X, P, H, eps, cfg, q8Kernel{m})
+			continue
+		}
+
+		ql := m.q8Layer(l)
 		Xn2 := normPanel
 		parFor(P, dispatchWorkers, func(lo, hi int) {
 			wPost := m.tensor(lp("post_attention_layernorm.weight"))

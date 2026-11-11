@@ -12,6 +12,14 @@ import (
 func TestDefaultPolicyProductionCapabilityFloor(t *testing.T) {
 	p := DefaultPolicy()
 
+	// The floor ships default-open: unlisted tools are admitted by default, while
+	// the provable-refusal rungs (Deny map, SelfModifyGlobs, dangerous-gotcha
+	// floor) still hold. Lock the posture so a regression back to fail-closed is
+	// caught here rather than only in the adjudication verdicts.
+	if p.Posture != PostureDefaultOpen {
+		t.Errorf("DefaultPolicy.Posture = %v, want PostureDefaultOpen", p.Posture)
+	}
+
 	categories := map[string][]string{
 		"standard coding tools": {
 			"Bash", "BashOutput", "KillShell", "PowerShell", "Read", "Edit", "Write",
@@ -100,10 +108,16 @@ func TestDefaultPolicyAdjudicationVerdicts(t *testing.T) {
 		}
 	}
 
-	// Unknown tools denied fail-closed
+	// Unknown tools are admitted by the shipped default_open posture, carrying
+	// the posture record; the explicit fail_closed lever still DEFAULT_DENYs.
 	vUnknown := a.Adjudicate(ctx, inlineCall("totally_unknown_custom_tool", `{}`))
-	if vUnknown.Kind != abi.VerdictDeny || vUnknown.Reason != abi.ReasonDefaultDeny {
-		t.Errorf("unknown tool: got %v/%s, want Deny/DEFAULT_DENY", vUnknown.Kind, abi.ReasonName(vUnknown.Reason))
+	if vUnknown.Kind != abi.VerdictAllow || vUnknown.Meta["posture"] != "default_open" {
+		t.Errorf("unknown tool under shipped default_open: got %v/%s Meta[posture]=%q, want Allow/default_open", vUnknown.Kind, abi.ReasonName(vUnknown.Reason), vUnknown.Meta["posture"])
+	}
+	strict := DefaultPolicy()
+	strict.Posture = PostureFailClosed
+	if vs := New(strict).Adjudicate(ctx, inlineCall("totally_unknown_custom_tool", `{}`)); vs.Kind != abi.VerdictDeny || vs.Reason != abi.ReasonDefaultDeny {
+		t.Errorf("unknown tool under explicit fail_closed: got %v/%s, want Deny/DEFAULT_DENY", vs.Kind, abi.ReasonName(vs.Reason))
 	}
 
 	// Explicit deny rules honored

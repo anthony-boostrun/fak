@@ -7759,6 +7759,16 @@
           "category": "incidental",
           "reason": "Reference to the existing ordinary serving-loader witness in an oracle description; no new session lifecycle or runtime abstraction is introduced.",
           "token": "SessionPrefill"
+        },
+        {
+          "category": "incidental",
+          "reason": "Typed #12100 readiness audit code for an existing session descriptor that cannot be decoded or matched to its ref identity; not a separate session-runtime primitive.",
+          "token": "UNREADABLE_SESSION_RECORD"
+        },
+        {
+          "category": "incidental",
+          "reason": "Typed #12100 readiness audit code for unbounded, missing, future-dated or overflow-prone heartbeat/TTL evidence; it reports unknown liveness and introduces no separate session-runtime primitive.",
+          "token": "UNKNOWN_SESSION_EVIDENCE"
         }
       ],
       "exclude": [
@@ -7904,6 +7914,8 @@
         "SetSessionAffinity",
         "SoftSlotStolen",
         "StoreVerifiedSlot",
+        "UNKNOWN_SESSION_EVIDENCE",
+        "UNREADABLE_SESSION_RECORD",
         "UNSUPPORTED_SESSION_KIND",
         "V41ExpertParallelSessionRequest",
         "VerifySessionMoveDestinationReceipt",
@@ -13204,6 +13216,11 @@
           "category": "incidental",
           "reason": "Private io.Reader adapter checking Go context.Context cancellation before bounded payload copy reads. It is request lifecycle plumbing, not LLM prompt context, context-window planning, compaction or memory ownership.",
           "token": "conversionContextReader"
+        },
+        {
+          "category": "incidental",
+          "reason": "Appears only as the pinned upstream Mooncake fabric_context.cpp filename in the attribution comment of internal/l3kv/device_mem_registration.go. It identifies foreign donor source provenance, not a declared or invoked Fak Go API or transport context implementation. Actual RegistrationContextCaps is separately positioned.",
+          "token": "fabric_context"
         }
       ],
       "exclude": [
@@ -13328,6 +13345,7 @@
         "ctxsleep",
         "dflash2ContextKV",
         "engramLookAheadContext",
+        "fabric_context",
         "fak_fleet_repo_pulse_context_tokens_saved_total",
         "fak_gateway_compaction_thrash_sessions_total",
         "featureActivationContextKey",
@@ -18226,6 +18244,11 @@
           "category": "false-positive",
           "reason": "perPlane is the checked byte count for one attended K or V storage row in analytical decode traffic arithmetic. Plane denotes physical storage, not an execution plan.",
           "token": "perPlane"
+        },
+        {
+          "category": "false-positive",
+          "reason": "oldPlanes is the saved Kraw/K/V allocation pointer slice used for staged arena growth and copying, not an execution or scheduling plan.",
+          "token": "oldPlanes"
         }
       ],
       "exclude": [
@@ -18239,6 +18262,7 @@
         "explanat",
         "hasTextToolCandidate",
         "kvFP8Planes",
+        "oldPlanes",
         "perPlane",
         "plane",
         "planeBytes",

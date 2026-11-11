@@ -202,7 +202,7 @@ const leaserefUsage = `fak leaseref - cross-machine lease visibility (over inter
       The delete is an ordinary ref delete that converges across clones the same way
       acquisition does.
 
-  fak leaseref audit [--dir DIR]
+  fak leaseref audit [--dir DIR] [--require-ready]
       READ-ONLY staleness report over refs/fak/locks/*: list every lease, classify
       live-vs-expired against now, and emit the garden control-pane envelope
       (ok/verdict/reason) plus would_reap[] dry-run evidence: owner, lane, tree,
@@ -215,6 +215,11 @@ const leaserefUsage = `fak leaseref - cross-machine lease visibility (over inter
       fenced release by its holder or an explicit operator --force, not the reaper.
       Reaps NOTHING — verdict ACTION
       is the signal to act. This is the member 'fak garden' folds.
+      --require-ready emits fak.leaseref-readiness.v1 and exits 1 while blocked.
+      It strictly reads pinned lease/session objects, exposes incompatible records,
+      and joins TTL hygiene with session liveness without mutating any refs.
+      Local Git observations, even when stable, cannot prove authoritative
+      freshness: this mode remains not ready until that authority is available.
 
   fak leaseref acquire --id ID --holder H [--session S] [--tree GLOB ...] [--ttl SEC] [--dir DIR] [--announce on|off|offline --announce-issue N --announce-repo OWNER/REPO]
       FENCED acquire (#906-C1): take the lease with a monotonic fencing token.
@@ -475,11 +480,29 @@ func runLeaserefReap(stdout, stderr io.Writer, argv []string) int {
 	now := time.Now()
 	rc := 0
 
+	// FIRST sweep: the filesystem-side orphan .lock reaper (#5348). A holder killed
+	// mid-CAS leaves a ghost <git-common-dir>/refs/fak/locks/*.lock that git never
+	// removes, and a ghost on ANY ref aborts the whole batched `update-ref --stdin`
+	// transaction the sweeps below depend on, degrading them to the per-ref
+	// casDelete crawl (measured 2026-11-08: 20,014 session-gw ghosts from killed
+	// concurrent reapers held every batch delete while ~27.6k expired session refs
+	// crawled at ~3 deletes/min). ReapLockFiles deletes only a .lock older than the
+	// lease TTL it guards (maxAge 0 => the 2400 s DefaultLockFileMaxAge), keeps a
+	// fresh (possibly-live) CAS, and fails closed on a future-dated mtime, so
+	// sweeping FIRST can only remove provably-stale ghosts. Best-effort like every
+	// sweep here: a failure is reported but never suppresses the others.
+	orphanLocks, keptLocks, kerr := store.ReapLockFiles(ctx, now, 0)
+	if kerr != nil {
+		fmt.Fprintf(stderr, "fak leaseref reap: locks: %v\n", kerr)
+		rc = 1
+	}
+
 	// Reap ALL THREE ref kinds under refs/fak/locks/*: expired lock leases, expired session
 	// descriptors, and lapsed intent claims (#2155). Each sweep is independent and
 	// best-effort — a failure on one kind is reported but never suppresses the others.
 	// Store.Reap / ReapSessions / ReapIntents delete only their own kind (the namespace
-	// split), so one kind is never mistaken for another.
+	// split), so one kind is never mistaken for another. They run AFTER the ghost sweep
+	// above so their one-transaction batch deletes see a lock-free namespace.
 	leases, lerr := store.Reap(ctx, now)
 	if lerr != nil {
 		fmt.Fprintf(stderr, "fak leaseref reap: leases: %v\n", lerr)
@@ -493,18 +516,6 @@ func runLeaserefReap(stdout, stderr io.Writer, argv []string) int {
 	intents, ierr := store.ReapIntents(ctx, now)
 	if ierr != nil {
 		fmt.Fprintf(stderr, "fak leaseref reap: intents: %v\n", ierr)
-		rc = 1
-	}
-	// Fourth sweep (#5348): the filesystem-side orphan .lock reaper, completing the
-	// ref-side Reap/ReapSessions/ReapIntents trio. A holder killed mid-CAS leaves a
-	// ghost <git-common-dir>/refs/fak/locks/*.lock that git never removes; ReapLockFiles
-	// deletes only a .lock older than the lease TTL it guards (maxAge 0 => the 2400 s
-	// DefaultLockFileMaxAge), keeps a fresh (possibly-live) CAS, and fails closed on a
-	// future-dated mtime. Best-effort like the sweeps above: a failure is reported but
-	// never suppresses the others.
-	orphanLocks, keptLocks, kerr := store.ReapLockFiles(ctx, now, 0)
-	if kerr != nil {
-		fmt.Fprintf(stderr, "fak leaseref reap: locks: %v\n", kerr)
 		rc = 1
 	}
 	fmt.Fprintf(stdout, "reaped %d expired lease(s), %d expired session(s), %d lapsed intent(s), %d orphan lock(s) (%d live lock(s) kept)\n",
@@ -539,11 +550,15 @@ func runLeaserefAudit(stdout, stderr io.Writer, argv []string) int {
 	fs.SetOutput(stderr)
 	dir := fs.String("dir", "", "repo dir (default: git discovery from cwd)")
 	asControlPane := fs.Bool("control-pane", false, "emit the garden control-pane envelope (the default for this verb)")
+	requireReady := fs.Bool("require-ready", false, "emit a fail-closed LAN-readiness report; local Git visibility alone is never READY")
 	_ = asControlPane // the audit verb only speaks the control-pane envelope; the flag is accepted for symmetry
 	if code, done := parseFlagsRejectArgs(fs, argv, stderr); done {
 		return code
 	}
 	*dir = pathutil.ExpandTilde(*dir)
+	if *requireReady {
+		return runLeaserefReadiness(stdout, stderr, *dir)
+	}
 	store := leaseref.NewInDir(*dir)
 	ctx := context.Background()
 	recs, err := store.List(ctx)

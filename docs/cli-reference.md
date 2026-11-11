@@ -464,9 +464,12 @@ poisoned instruction while the task still completes.
 
 The boundary above is offline. To put the gate **in front of a real model** over
 OpenAI-compatible HTTP, run `fak serve`: it fronts any OpenAI-compatible upstream
-(Ollama / vLLM / llama.cpp / a cloud provider), and on every `/v1/chat/completions`
-it denies / repairs / quarantines the tool calls the model proposes before returning
-the survivors.
+(Ollama / vLLM / llama.cpp / a cloud provider). By default `fak serve` is a **raw
+inference pipe**: requests and tool calls/results pass through with zero interception
+processing. Arm the tool guard with `--guard` (or `FAK_GUARD=on`) and every
+`/v1/chat/completions` then denies / repairs / quarantines the tool calls the model
+proposes and screens inbound tool results (secret/PII masking, injection quarantine)
+before returning the survivors.
 
 ```bash
 ollama serve &                         # any OpenAI-compatible server on :11434
@@ -480,7 +483,26 @@ curl -s http://127.0.0.1:8080/metrics | head                # Prometheus scrape
 
 Point any OpenAI client at `http://127.0.0.1:8080/v1`. `fak serve` also speaks the
 Anthropic `/v1/messages` wire, exposes `/metrics` + `/debug/vars`, and takes
-`--policy floor.json` + `--require-key-env VAR` to harden it. One caveat worth
+`--policy floor.json` + `--require-key-env VAR` to harden it. The tool-guard posture —
+whether the router intercepts the tool plane at all — is **raw pass-through by
+default**; `--guard` (env `FAK_GUARD`) arms tool-call adjudication + tool-result
+screening, and the resolved posture is stated in the startup messages
+([router tool-guard defaults](architecture/router-tool-guard-defaults.md)). The
+context plane is raw by default too: no oversize tool-result paging
+(`--ctx-paging`, env `FAK_CTX_PAGING`), no old-tool-result elision or
+restore-tool injection (`--chat-elide`, env `FAK_CHAT_ELIDE`), and the per-lever
+savers (`--ctx-view-budget`, `--compact-history-budget`, `--elide-result-bytes`,
+`--elide-stale-reads`, `--vcache-anchor`, `--defer-cold-tools`) all default off —
+each re-arms by name
+([serving-router context-plane defaults](architecture/serve-context-plane-defaults.md)).
+The gateway's own
+lease-admission posture (what its floor does with a refused write after the kernel
+allowed the call) is set by `--workspace-admission open|permissive|strict`
+(default `open`: admit-and-log with `would_deny` forensic records; `permissive`
+admits DEFAULT_DENY-class only; `strict` enforces every refusal; env:
+`FAK_WORKSPACE_ADMISSION`). `--workspace-admission-permissive` remains as the legacy
+compat lever (env: `FAK_WORKSPACE_ADMISSION_PERMISSIVE`); kernel policy denials are
+never affected. One caveat worth
 knowing up front: `stream:true` SSE is **synthesized from the finished,
 already-adjudicated turn** — well-formed, but not true token-by-token streaming. (The
 client's `max_tokens`/`temperature`/`top_p`/`stop` are now forwarded per request, so
@@ -670,7 +692,7 @@ fak agent --effort ultra --task "Refactor gateway protocol adapters"
 fak agent --subagents=false --task "Lint markdown docs"
 ```
 
-See [Native Harness Subagents & Effort Slider](../architecture/native-harness-subagents-default-and-effort-slider.md) for full architectural specifications, memory models, and empirical benchmarks.
+See [Native Harness Subagents & Effort Slider](architecture/native-harness-subagents-default-and-effort-slider.md) for full architectural specifications, memory models, and empirical benchmarks.
 
 ## Verbs
 
@@ -692,6 +714,29 @@ this reference stays the front door; every section is preserved verbatim:
 - the out-of-band operator control plane (session, signal, ps, top): [operator-control-plane.md](operator-control-plane.md)
 - the kernel map: file table, one-breath contract, witness-closed shipped table, honest limits, and wave-0 build history: [kernel-map.md](cli/kernel-map.md)
 
+## `fak wip`: working-tree checkpoint/restore
+
+`fak wip` gives a session a durable, gc-safe snapshot of its uncommitted tracked
+changes under `refs/fak/wip/<session>` without touching the index, the working
+tree, or any branch. The capture is deliberately tree-wide (peer edits included);
+`--path` records what the session claims so a later `land` commits only those
+paths. Full reference: `fak wip help`. Human sharing/hand-off guide:
+[operator/wip-sharing.md](operator/wip-sharing.md).
+
+| Subcommand | Purpose |
+|---|---|
+| `checkpoint` | Snapshot the tracked delta to `refs/fak/wip/<session>`; `--path` records claimed scope. |
+| `status` | List live checkpoints graded REPLICATED / STALE_REMOTE / LOCAL_ONLY; `--fleet` enumerates peer hosts. |
+| `sync` | Opt-in replication to a remote (push then fetch into `refs/fak/remotewip/<remote>/*`; `--push-only` / `--fetch-only`). |
+| `restore` | Print the checkpointed delta as an apply-able diff, or `--apply` it onto the tree. |
+| `land` | Turn a checkpoint into a real commit of the declared file set; refuses undeclared tree-wide snapshots. |
+| `park` | Suspend owner-authorized dirty paths across in-place integration (dry-run by default). |
+| `reconcile` / `adopt` | Decide DISCARD / RECLAIM / QUARANTINE for crashed sessions; `adopt` claims and materializes one. |
+| `reap` | Delete checkpoints whose delta has landed in HEAD (`--census` reports only). |
+| `queue` | Deterministic action queue with the exact next command for every checkpoint/worktree. |
+| `inventory` | Read-only census of main WIP, ignored files, worktrees, residue, checkpoints. |
+| `attribute` | Attribute every dirty hunk to the session that checkpointed it (OWNED / SHARED / ORPHAN). |
+
 ## `fak guard`
 
 ```text
@@ -712,6 +757,18 @@ Fronts an interactive or autonomous agent with the in-process capability floor, 
 - `--policy <path>`: capability-floor manifest to enforce (default: built-in guard floor).
 - `--dump-policy`: print the built-in guard capability floor (an editable manifest) to stdout and exit.
 - `--dump-strict-policy`: print the strict fail-closed capability floor manifest (`posture: fail_closed`) to stdout and exit.
+
+### Gateway lease admission
+
+The kernel's capability floor decides whether a call may run in principle; the gateway's own lease-admission floor then decides whether this guarded session may write the named workspace tree *now* (unknown write footprint, unavailable authority, targets outside the workspace, or a peer lease holding the trees). Its posture is set by:
+
+- `--workspace-admission open|permissive|strict`: gateway lease-admission posture (default `open`; env: `FAK_WORKSPACE_ADMISSION`).
+  - `open` (going-forward default): admit-and-log — DEFAULT_DENY-class refusals **and** peer `LEASE_HELD` conflicts are admitted with `would_deny` forensic records after a kernel allow.
+  - `permissive`: the legacy lever — DEFAULT_DENY-class refusals admitted; peer `LEASE_HELD` conflicts remain enforced.
+  - `strict`: the legacy shipped default — every lease-admission refusal stands.
+- `--workspace-admission-permissive`: legacy compat lever superseded by `--workspace-admission`; true resolves the mode to `permissive` when no explicit mode is set (env: `FAK_WORKSPACE_ADMISSION_PERMISSIVE`).
+
+Kernel policy denials are never affected: lease admission only runs after a kernel ALLOW/TRANSFORM. An unknown `--workspace-admission` token fails loud at flag-parse time with the valid set.
 
 ### Dangerous Gotchas catalog and carveouts
 

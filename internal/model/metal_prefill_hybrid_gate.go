@@ -17,8 +17,10 @@ package model
 // twin feeds it a GPU f16 GEMM (#71).
 
 // metalQwen35HybridPrefillOK gates the Metal hybrid prefill. It is the SAME architecture gate the
-// Q8 and resident-Q4_K hybrid paths use (q8Qwen35HybridPrefillOK) — the Metal path covers the
-// identical Qwen3.5/3.6 hybrid family; only the projection backend differs.
+// Q8 and resident-Q4_K hybrid paths use (qwen35HybridPrefillArchOK), including the qwen3_5_moe
+// hybrid: prefillQwen35HybridViaMM keeps an MoE layer's attention/GDN projections on the backend
+// GEMM and runs the routed FFN per row on the token loop's kernel (prefillQwen35RowFFNQ). Only the
+// projection backend differs.
 func metalQwen35HybridPrefillOK(cfg Config, promptLen int) bool {
-	return q8Qwen35HybridPrefillOK(cfg, promptLen)
+	return qwen35HybridPrefillArchOK(cfg, promptLen)
 }

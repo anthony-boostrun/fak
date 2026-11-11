@@ -14,7 +14,17 @@ import (
 
 const qwen35HybridQBatchMinPrompt = 16
 
+// q8Qwen35HybridPrefillOK gates the batched Q8 hybrid prefill. It admits the
+// Qwen3.5/3.6 MoE hybrid (qwen3_5_moe, e.g. Qwen3.6-35B-A3B): the attention and
+// linear-attention sublayers stay batched and only the routed FFN runs per row
+// (prefillQwen35RowFFNQ), through the token loop's exact ffnForLayer(l).apply call on
+// the token loop's kernel. The resident-Q4_K lane and the Metal twin share this gate.
 func q8Qwen35HybridPrefillOK(cfg Config, promptLen int) bool {
+	return qwen35HybridPrefillArchOK(cfg, promptLen)
+}
+
+// qwen35HybridPrefillArchOK holds every non-FFN axis the batched hybrid panel models.
+func qwen35HybridPrefillArchOK(cfg Config, promptLen int) bool {
 	// Cross-quant diagnostic for #4273: force the established token-at-a-time
 	// prefill so real-model runs can isolate the batched hybrid prefill from the
 	// tokenizer, sampler, and decode path. Default performance stays unchanged.
@@ -24,7 +34,6 @@ func q8Qwen35HybridPrefillOK(cfg Config, promptLen int) bool {
 	return cfg.IsQwen35Hybrid() &&
 		promptLen >= qwen35HybridQBatchMinPrompt &&
 		cfg.AttnOutputGate &&
-		!cfg.IsMoE() &&
 		!cfg.DenseMLP &&
 		!cfg.Alibi &&
 		cfg.NormGain1p &&
@@ -37,7 +46,14 @@ func q8Qwen35HybridPrefillOK(cfg Config, promptLen int) bool {
 // restored recurrent state. Packed KV and scalar-only capture/steering/model
 // transforms retain token-loop execution; the panel must not silently skip them.
 func (s *Session) q8Qwen35HybridPrefillSessionOK(promptLen int) bool {
-	if !q8Qwen35HybridPrefillOK(s.M.Cfg, promptLen) || s.Cache.quantized() ||
+	return q8Qwen35HybridPrefillOK(s.M.Cfg, promptLen) && s.qwen35HybridPrefillObserversOK()
+}
+
+// qwen35HybridPrefillObserversOK is the session half of the batched hybrid admission:
+// packed KV, target-hidden capture, residual hooks, PRISM transforms, hidden taps and
+// attention sinks all run only inside the token loop, so any of them keeps it.
+func (s *Session) qwen35HybridPrefillObserversOK() bool {
+	if s.Cache.quantized() ||
 		s.captureTargetHidden || s.M.Cfg.EnableResidualHook || s.M.prism != nil || s.activeTap() != nil {
 		return false
 	}
@@ -133,6 +149,15 @@ func (s *Session) prefillQwen35HybridQHiddenWithGDNMode(ids []int, normWorkspace
 		})
 		s.phaseEnd("attn_residual", t)
 
+		if cfg.IsMoE() {
+			// Routed FFN: each row picks its own top-k experts, so it runs per row
+			// through the token loop's exact PreNorm sublayer and kernel.
+			t = s.phaseStart()
+			s.prefillQwen35RowFFNQ(l, X, P)
+			s.phaseEnd("qwen35_moe_row_ffn", t)
+			continue
+		}
+
 		Xn2 := normWorkspace.panel(P, H)
 		wPost := m.tensor(lp("post_attention_layernorm.weight"))
 		t = s.phaseStart()
@@ -193,6 +218,17 @@ func (s *Session) prefillQwen35HybridQHiddenWithGDNMode(ids []int, normWorkspace
 	xf := rmsnormCfg(X[(P-1)*H:P*H], m.tensor("model.norm.weight"), eps, cfg)
 	s.phaseEnd("final_norm", t)
 	return xf
+}
+
+// prefillQwen35RowFFNQ applies layer l's FFN sublayer to each of the P rows of X in
+// place, in token order, through prefillRowFFN (blockStep's composeSublayer(PreNorm) +
+// mlpNorms + ffnForLayer(l).apply) on tokenHiddenQKernel, the kernel the token loop hands
+// blockStep: q8Kernel for a Q8 MoE session, sessionQ4KKernel with resident Q4_K weights.
+// So each row's FFN delta (routed experts plus the gated qwen35SharedExpert) is the token
+// loop's own arithmetic for the same residual input.
+func (s *Session) prefillQwen35RowFFNQ(l int, X []float32, P int) {
+	m, cfg := s.M, s.M.Cfg
+	m.prefillRowFFN(l, X, P, cfg.HiddenSize, float32(cfg.RMSNormEps), cfg, s.tokenHiddenQKernel())
 }
 
 func (s *Session) prefillQwen35LinearLayerQ(l int, Xn []float32, P int, qz func([]float32, int, int) *q8Panel) []float32 {

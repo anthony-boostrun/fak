@@ -287,6 +287,27 @@ The full upstream LICENSE at the pinned revision follows:
    limitations under the License.
 ```
 
+## TensorFold checkpoint metadata discovery (model info)
+
+- Upstream: ashhart/TensorFold, commit
+  `9e8c368b0b4c2c7892a0c9f0f302d7c164016209` (Apache-2.0), source
+  `zig/src/cli/info.zig:15` (`run`):
+  https://github.com/ashhart/TensorFold/blob/9e8c368b0b4c2c7892a0c9f0f302d7c164016209/zig/src/cli/info.zig
+- Adaptation: `cmd/fak/model.go` (`runModelInfo`, `resolveModelInfoTarget`,
+  `readModelInfoReport`) re-expresses the cached-checkpoint report in Go:
+  resolve a ref to a locally cached checkpoint, read its header only, report
+  family / weight format / declared context / weight bytes / memory floor
+  (weights plus a fixed runtime margin), refuse an uncached ref with a pull
+  hint, and refuse an unregistered model type by naming the registry. No Zig
+  code blocks are copied; the line-oriented report shape and the floor-is-not-
+  capacity contract are adapted.
+- License: Apache License 2.0, already reproduced above under "TensorFold
+  benchmark evidence".
+- Witness: `TestModelInfoReportsCachedCheckpointMetadata` in
+  `cmd/fak/model_info_test.go` pins the exact report values, the pull-hint
+  refusal, the registry-naming refusal, the `ErrUnknownModelType` gate chain,
+  and the non-GGUF redirect (software evidence only).
+
 ## TensorFold draft-depth pooled verify costs
 
 - Upstream: ashhart/TensorFold, commit
@@ -305,6 +326,28 @@ The full upstream LICENSE at the pinned revision follows:
 - Witness: `TestDraftDepthPooledCostsAndKeepStop` in
   `internal/model/draft_depth_cost_test.go` pins the pooled verify-cost
   table and the confidence-priced keep/stop rule (software evidence only).
+
+## TensorFold embeddings encoder worker
+
+- Upstream: ashhart/TensorFold, commit
+  `9e8c368b0b4c2c7892a0c9f0f302d7c164016209` (Apache-2.0), sources
+  `zig/src/server/embeddings.zig` and `zig/src/server/embedding_request.zig`:
+  https://github.com/ashhart/TensorFold/blob/9e8c368b0b4c2c7892a0c9f0f302d7c164016209/zig/src/server/embeddings.zig
+- Adaptation: `internal/gateway/embedding_worker.go` re-expresses the
+  embeddings reply contract in Go: capability and input validation before
+  encoder work, sequence-boundary-preserving text/token batch admission under
+  per-input limits, declared dimensions/float/base64 capabilities, refusal of
+  out-of-vocabulary tokens and non-length finishes, borrowed output storage
+  that survives cancellation to completion, and unwritten vectors or
+  generated tokens that cannot become successful embeddings;
+  `handleEmbeddings` in `internal/gateway/embeddings.go` consults the
+  installed worker ahead of the causal and hashing fallbacks. No Zig code
+  blocks are copied; the contract is adapted.
+- License: Apache License 2.0, already reproduced above under "TensorFold
+  benchmark evidence".
+- Witness: `TestEmbeddingsEncoderWorkerContract` in
+  `internal/gateway/embeddings_worker_test.go` pins the wired 200/refusal
+  matrix over handleEmbeddings (software evidence only).
 
 ## TensorFold decode/prefill wall-time share
 
@@ -2472,3 +2515,250 @@ kernels" section above.
 - Witness: `TestQwen38MTP_Adaptive_ModeledCostPricing` in
   `internal/model/qwen38_mtp_adaptive_test.go` pins the modeled keep/more
   pricing and the per-step EMA fold (software evidence only).
+
+## vLLM O(1)-amortized KV-load bookkeeping
+
+`internal/modelengine/kv_load_bookkeeping.go` adapts the per-block CPU-cost
+reduction of async KV-load lifecycle bookkeeping from vLLM PR #65831
+("[Perf][Core] Reduce per-block CPU cost of KV block allocation and caching"),
+merged at `518c624a1c731cfc6c73369ced6351cb03754ddf`:
+https://github.com/vllm-project/vllm/blob/518c624a1c731cfc6c73369ced6351cb03754ddf/vllm/v1/core/block_pool.py
+plus `vllm/v1/core/kv_cache_manager.py` at the same revision.
+
+Copyright contributors to the vLLM project. SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: idiomatic Go re-expression (no upstream code copied) as a
+standalone per-request KV-load bookkeeper — amortized-constant per-request
+state, cached running-sum aggregates updated by O(1) deltas on start,
+promote-to-running, finish and release, and an explicit pool-touch counter that
+pins N load transitions to O(N) total pool-slot accesses so schedule() never
+re-walks the whole pool per step. Scheduler integration into
+`internal/modelengine/nativesched.go` is a follow-on. Witnessed by
+`TestKVLoadBookkeepingTransitionsCostLinearInTransitions` in
+`internal/modelengine/kv_load_bookkeeping_test.go` (software evidence only).
+The full Apache License, Version 2.0 reproduced in the "TensorFold benchmark
+evidence" section above applies to this adaptation.
+
+## SGLang DSV4.1 Engram packed-gather (MXFP4 lookup tables, in-register E2M1 decode)
+
+`internal/compute/engram_packed_gather.go` adapts the packed conditional-memory
+(Engram) gather of SGLang PR #47935 ("DSV4.1 Engram packed-gather"), merged at
+`3f5b1bec8e00115bc8439b5b9a9da902822d2f82` on 2026-11-04:
+https://github.com/sgl-project/sglang/pull/47935
+Sources at that revision: `python/sglang/kernels/ops/embeddings/engram_gather.py`
+and `test/registered/kernels/ops/embeddings/test_engram_gather.py`.
+
+Copyright contributors to the SGLang project. SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: idiomatic Go re-expression (no upstream code copied) as a closed
+in-memory component. The packed storage contract is kept bit-exact: two E2M1
+values per payload byte (even column in the low nibble), unchanged per-32 E8M0
+scales, and the gather decodes each element in-register so no widened copy of the
+table is materialized. Two deliberate deviations, both pinned by tests: the output
+carries the upstream bf16-rounded value as float32 instead of a bf16 ABI, and the
+reserved E8M0 scale byte 0xFF is refused at construction instead of being bitcast
+to +Inf. Witnessed by `TestEngramPackedGatherMatchesExpandedReferenceBitForBit`,
+`TestEngramPackedGatherNoExpansionAllocation`,
+`TestEngramPackedGatherSentinelErrors` and
+`TestEngramPackedGatherHalvesTableRowBytes` in
+`internal/compute/engram_packed_gather_test.go` (software evidence only; no
+hardware or whole-model performance claim). The full Apache License, Version 2.0
+text is reproduced in the "TensorFold benchmark evidence" section above.
+
+## vLLM DeepSeek-V4.1-Flash forward-requested cache-class enumeration
+
+`internal/model/arch.go` adapts the one-pass forward-requested cache-class
+enumeration of the DeepSeek-V4.1-Flash H200 recipe from
+`recipes/models/deepseek-ai/DeepSeek-V4.1-Flash.yaml` at pin
+`e740badc2e3df13a5c2abfca04ed0ac917985c5f`:
+https://github.com/vllm-project/vllm/blob/e740badc2e3df13a5c2abfca04ed0ac917985c5f/recipes/models/deepseek-ai/DeepSeek-V4.1-Flash.yaml
+
+Copyright contributors to the vLLM project. SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: idiomatic Go re-expression (no upstream code copied) as a
+CacheClassManifest registration schema — per-layer 128-token sliding-window KV,
+FP4 compressed latents at ratios 1 and 2 on layers 2/8/14/20, mxfp4 sparse-indexer
+KV, and compressor recurrent state — plus a fail-closed pre-load gate that refuses
+a declared-but-unregistered class with the ErrUnregisteredCacheClass sentinel so
+loader, admission and device-op checks derive their class listings from the
+registration instead of ad-hoc lists. Witnessed by
+`TestCacheClassRegistration*` in `internal/model/cache_class_test.go`
+(software evidence only; no hardware or whole-model claim). The full Apache
+License, Version 2.0 reproduced in the "TensorFold benchmark evidence" section
+above applies to this adaptation.
+
+## llama.cpp CUDA MoE layout linearization
+
+`internal/compute/moe_linear_layout.go` adapts the linearized MoE expert weight layout of
+ggml-org/llama.cpp PR #31047 (`ggml/src/ggml-cuda/mmf.cu` and `ggml/src/ggml-cuda/mmf.cuh`), at
+llama.cpp revision `69ee2ecc0150ba7d1204a7f7393dfd651569db8c`:
+https://github.com/ggml-org/llama.cpp/tree/69ee2ecc0150ba7d1204a7f7393dfd651569db8c/ggml/src/ggml-cuda
+
+Changed for Fak: host-side Go layout contract only — resident expert rows compacted into one
+contiguous pool behind a per-expert byte-offset table, a launch planner that consumes those
+offsets instead of runtime gathers (counting an unserved request as a gather step rather than
+fabricating an address), and a strided-reference oracle that pins tile identity on fixed
+fixtures. No CUDA kernel, no copied upstream code block, and no performance claim are included.
+The upstream license is the MIT License reproduced under "llama.cpp Q4_K MMQ prompt-panel GEMM"
+above (Copyright (c) 2023-2026 The ggml authors).
+## vLLM + SGLang batched speculative block verification
+
+`internal/compute/mtp_rdna35.go` adapts whole-block speculative verification
+from vLLM PR #61994 ("batched target verification of a drafted speculative
+block in one forward pass"), merged at `af6665b5`, and SGLang PR #44848
+(same mechanism: per-position accept/reject read from fused logits, tail
+rejected on argmax divergence), merged at `4cbea9d3`:
+https://github.com/vllm-project/vllm/pull/61994
+https://github.com/sgl-project/sglang/pull/44848
+
+Copyright contributors to the vLLM project / SGLang project.
+SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: idiomatic Go re-expression (no upstream code copied) as
+`SelectBlockVerifyMode` (admission probe: batched only when the drafter is
+live and the block holds more than one token; the serial verifyNative path
+remains the only visible route otherwise), `argmaxFloat32` (first-maximum
+greedy oracle, ties resolve to the lowest index), and `BatchedBlockVerify`,
+which maps each fused logit row to its argmax and delegates acceptance to
+`EvaluateDraftAcceptance`'s closed contract so batched and serial verify emit
+identical greedy token streams at a fixed seed. Wired into the speculative
+control gate by `SpeculativeControl.StepBlockVerify` in
+`internal/model/speculative_control.go`. Witnessed by `TestBatchedBlockVerify*`
+in `internal/compute/mtp_rdna35_test.go` and
+`TestBatchedBlockVerifyGate` /
+`TestSpeculativeControl_BatchedBlockVerifyParity` in
+`internal/model/speculative_control_test.go` (software evidence only; no
+throughput or hardware claim). The full Apache License, Version 2.0
+reproduced in the "TensorFold benchmark evidence" section above applies to
+this adaptation.
+
+## SGLang Kimi-K3 tool-choice terminal contract
+
+`internal/grammar/toolchoice_terminal.go` adapts the required/none structural
+suffix rules in SGLang PR #48480 at commit
+`ebeed893722150a29303d9eb9bd975abec4072a5`:
+https://github.com/sgl-project/sglang/blob/ebeed893722150a29303d9eb9bd975abec4072a5/python/sglang/srt/function_call/kimik3_structural_tag.py
+
+Copyright contributors to the SGLang project.
+SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: an independently written Go state machine over validated
+structural events. Required mode permits completion only after a nonempty
+tools section closes, including multiple calls when parallel mode is enabled;
+none mode refuses tools and requires a complete validated nonempty response.
+An optional message close remains consumable after completion becomes
+available. The caller validates text, argument syntax, selected tool names
+and response-channel boundaries. Auto mode, raw text parsing and sampler
+integration are outside this bounded contract. The full Apache License,
+Version 2.0 reproduced in the "TensorFold benchmark evidence" section above
+applies to this adaptation.
+
+## SGLang Kimi-K3.1 sparse-MLA bring-up contract
+
+`internal/model/kimik31_trio.go` adapts the sparse-MLA/indexer dependency
+and paged top-k mapping described by SGLang PR #48415, merged at
+`61a3c7f2a45f6cfd5fdcec90fd5019d2334c2f0e`:
+https://github.com/sgl-project/sglang/pull/48415
+https://github.com/sgl-project/sglang/blob/61a3c7f2a45f6cfd5fdcec90fd5019d2334c2f0e/python/sglang/kernels/ops/attention/dsv4/topk.py
+
+Copyright contributors to the SGLang project.
+SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: an independently written Go host contract requiring the
+canonical K3.1 architecture, sparse MLA and a top-k indexer; unavailable
+capabilities fail closed without a dense-MLA fallback. A fixed-page-table
+oracle maps selected causal token indices to physical page offsets,
+pads missing selections with -1, rejects malformed geometry and visible
+NaNs, and reuses Fak's deterministic DSA selection. Device row/top-k
+capacity limits are not modeled. This does not register a serving forward
+path, copy CUDA kernels, or establish hardware or served-token parity.
+The full Apache License, Version 2.0 reproduced in the "TensorFold benchmark
+evidence" section above applies to this adaptation.
+
+## SGLang expert residency sizing
+
+`internal/modelloadplan/expert_residency_autosize.go` adapts the contract described at:
+https://github.com/sgl-project/sglang/blob/8a0edcf799d06bdee8832356d382495e7fb50f22/docs/docs/advanced_features/paged_experts.mdx
+
+Copyright contributors to the SGLang project.
+SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: a pure Go slot-budget policy over caller-established free and reserved bytes, equal per-layer costs, minimum router capacity and expert-count cap. It does not implement observed-load ranking, loader integration, runtime memory reservation or upstream KV fallback.
+The full Apache License, Version 2.0 reproduced in the "TensorFold benchmark
+evidence" section above applies to this adaptation.
+
+## SGLang small-M dispatch window
+
+`internal/compute/smallm_dispatch.go` adapts the contract described at:
+https://github.com/sgl-project/sglang/blob/58484246d26523eaf1a7f16ab524deee288d2120/python/sglang/kernels/jit/csrc/gemm/hopper_bf16_tiny_gemv.cuh
+
+Copyright contributors to the SGLang project.
+SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: a Go host geometric selector bounded to M<=32, N<=64 and positive K aligned to1024 and representable by uint32. Unsupported positive shapes use a general-path decision. No kernel is copied or invoked; numeric kernel parity and device qualification are not established.
+The full Apache License, Version 2.0 reproduced in the "TensorFold benchmark
+evidence" section above applies to this adaptation.
+
+## vLLM sequence and pipeline boundary contract
+
+`internal/model/sp_pp_boundary.go` adapts the contract described at:
+https://github.com/vllm-project/vllm/blob/213e64562ba6e82ffce95774fa37fd294f3bc8ee/vllm/models/minimax_m3/nvidia/model.py
+
+Copyright contributors to the vLLM project.
+SPDX-License-Identifier: Apache-2.0.
+Changed for Fak: an independently written Go host oracle for contiguous padded token shards, gathering and trimming to the true token count, and re-sharding at receiving stages. Geometry checks prevent representability overflow, not practical out-of-memory failures. No distributed transport or hardware execution is implemented.
+The full Apache License, Version 2.0 reproduced in the "TensorFold benchmark
+evidence" section above applies to this adaptation.
+
+## llama.cpp expert-cache ClassLRU policy
+
+`internal/modelloadplan/expert_cache_lrfu.go` adapts the logical expert-cache ClassLRU policy from `ggml-org/llama.cpp`, `src/llama-moe-cache.cpp:17-228`, at revision `c4fb579695320929b6a453f4f3a56951bda332ee`.
+
+Copyright (c) 2023-2026 The ggml authors. SPDX-License-Identifier: MIT. The complete permission and warranty notice is preserved in the adapted source file and the upstream LICENSE.
+
+The Go policy preserves per-layer token clocks, retained recency/frequency scores, eight class-specific LRU lists, current-batch protection, and maximum normalized-age victim selection. This component does not load weights, change cache defaults or claim hardware/performance qualification.
+
+## vLLM draft KV dtype inheritance
+
+`internal/model/draft_kv_dtype.go` adapts the draft KV dtype selection contract
+from vLLM at revision `31f84f6b957b5f5309f66130efc3c1df07d8a995`:
+https://github.com/vllm-project/vllm/blob/31f84f6b957b5f5309f66130efc3c1df07d8a995/vllm/config/speculative.py
+(`kv_cache_dtype`: an unspecified draft dtype inherits the target declaration).
+Copyright contributors to the vLLM project. SPDX-License-Identifier: Apache-2.0.
+Reuse decision: ADAPT. No Python source copied; the Go component only selects
+a declaration and does not implement a cache backend. The Apache-2.0 license
+text already reproduced in this file applies.
+
+## Mooncake TENT fabric memory-registration contract
+
+Source: https://github.com/kvcache-ai/Mooncake at 2d41f1a62cf49cf464a8e2acee800708f34ee4af. Copyright 2026 KVCache.AI. Apache License 2.0, https://github.com/kvcache-ai/Mooncake/blob/2d41f1a62cf49cf464a8e2acee800708f34ee4af/LICENSE-APACHE.
+
+Adapted source: mooncake-transfer-engine/tent/include/tent/transport/fabric/fabric_attrs.h and fabric_transport.h, plus tent/src/transport/fabric/fabric_context.cpp and fabric_transport.cpp.
+
+The new internal/l3kv/device_mem_registration.go is a Go host planner adapting the host-versus-CUDA registration classification, ordinal propagation, CUDA-build/FI_HMEM refusal and all-context capability gate. It adds closed metadata validation and explicit unsupported-device refusal. It does not port CUDA/libfabric execution, registration resources, transport fallback, memory ownership or hardware transfer.
+
+## vLLM Qwen4Exp QSA shared top-k scratch
+
+`internal/model/qsa_shared_scratch.go` adapts the shared top-k selection
+buffer contract from vLLM PR #65619 at revision
+`9a56d4fec6b0a30a0a989f1cd06cd3c2f7325619`:
+https://github.com/vllm-project/vllm/pull/65619
+(one hoisted int32 buffer sized max_num_batched_tokens x
+(indexer_budget + compress_ratio), owned by the model object, passed to every
+QSA sparse-attention layer and reused by the MTP drafter instead of a private
+copy — the pattern DeepSeek V4, GLM-5.3-Flash and MiniMax-M3 already use).
+Copyright contributors to the vLLM project. SPDX-License-Identifier: Apache-2.0.
+Reuse decision: ADAPT. No Python source copied; the Go component owns one
+int32 slice and hands aliasing views to the layers and the drafter, with
+fail-closed sizing sentinels. Component only; no kernel or hardware claim.
+The Apache-2.0 license text already reproduced in this file applies.
+
+## llama.cpp GLM-5.3 next-sm state-tensor arch registration
+
+`internal/model/glm53_state_tensor.go` adapts the GLM-5.3 (glm5-next) extra
+state-tensor arch-registration contract from `ggml-org/llama.cpp` PR #30499
+("meta: support GLM-5.3 next sm tensor"), commit
+`259d91709d60945911bedb9bcfb2957c6e153ea7`, `src/llama-arch.cpp` +
+`src/llama-model.cpp`:
+https://github.com/ggml-org/llama.cpp/pull/30499
+(the arch descriptor admits glm5-next to per-tensor state allocation once the
+meta backend registers the KDA recurrent latent state and the q/k/v
+short-convolution history for per-layer allocation).
+Copyright (c) 2023-2026 The ggml authors. SPDX-License-Identifier: MIT.
+Reuse decision: ADAPT. No C++ source copied; the Go component declares the
+registered state tensor classes, threads them through per-layer state
+allocation, and refuses checkpoint/descriptor mismatches in both directions
+with sentinel errors. Component only; no kernel, no forward wiring, no
+hardware claim.

@@ -108,6 +108,31 @@ func New(cfg Config) (*Server, error) {
 	if err := agent.ValidateSoftSlotPolicy(cfg.LlamaSoftSlotPolicy); err != nil {
 		return nil, fmt.Errorf("gateway: --llama-soft-slot-policy: %w", err)
 	}
+	// The lease-admission posture is a security boundary (it decides whether the
+	// gateway's own floor stands or admits-and-logs), so an explicit but
+	// unparsable mode fails loud at boot rather than silently falling back to a
+	// default posture.
+	if _, err := ParseWorkspaceAdmissionMode(cfg.WorkspaceAdmission); err != nil {
+		return nil, fmt.Errorf("gateway: workspace admission mode: %w", err)
+	}
+	// The tool-guard posture is the SAME class of boundary (it decides whether
+	// the tool-call/result interception floor stands at all), so an explicit but
+	// unparsable value fails loud at boot rather than silently raw-passing.
+	toolGuardMode, err := ParseToolGuardMode(cfg.ToolGuard)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: tool guard mode: %w", err)
+	}
+	// The context-plane postures are the SAME class of boundary (they decide
+	// whether the gateway rewrites the served context at all), so an explicit
+	// but unparsable value fails loud at boot rather than silently rewriting.
+	ctxPagingMode, err := ParseCtxPagingMode(cfg.CtxPaging)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: ctx paging mode: %w", err)
+	}
+	chatToolResultElideMode, err := ParseChatToolResultElideMode(cfg.ChatToolResultElide)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: chat tool-result elide mode: %w", err)
+	}
 	// A misconfigured routing policy is a security boundary (it decides which model
 	// — local or remote — a tenant payload reaches), so validate it at New and fail
 	// loud rather than fall through to a silent default model at dispatch time.
@@ -269,6 +294,11 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		causalEmbeddings:             causalEmbeddings,
 		workspaceAdmissionPermissive: cfg.WorkspaceAdmissionPermissive,
+		workspaceAdmissionMode:       ResolveWorkspaceAdmissionMode(cfg),
+		toolGuardOff:                 toolGuardMode == ToolGuardOff,
+		ctxPagingMode:                ctxPagingMode,
+		chatToolResultElideOff:       chatToolResultElideMode == ChatToolResultElideOff,
+		sessionLane:                  strings.TrimSpace(cfg.SessionLane),
 		k:                            k,
 		toolPlugins:                  append([]toolplugin.Plugin(nil), cfg.ToolPlugins...),
 		toolPreferences:              cfg.ToolPreferences,
@@ -331,6 +361,7 @@ func New(cfg Config) (*Server, error) {
 		exposeProfile:                cfg.ExposeProfile,
 		elideResultBytes:             ablateUncachedTrimBytes(cfg.ElideResultBytes),
 		elideStaleReads:              cfg.ElideStaleReads,
+		modelPassthrough:             cfg.ModelPassthrough,
 		provider:                     strings.TrimSpace(cfg.Provider),
 		prefixGuard:                  cfg.PrefixGuard || envEnabled("FAK_ABLATE_PREFIX_GUARD"),
 		contextEpoch:                 newContextEpochGate(envEnabled("FAK_ABLATE_CONTEXT_EPOCH")),

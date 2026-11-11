@@ -50,12 +50,12 @@ func TestCUDARawHiddenSourceLifetime(t *testing.T) {
 		}
 		return s[i : i+j]
 	}
-	prefix := between(entry, "transientStart := len(c.transient)", "kv, err := c.validateQwen35SequenceRequestLocked(req)")
+	prefix := between(entry, "transientStart := len(c.transient)", "kv, err := c.validateQwen35SequenceStoreRequestLocked(req, paged)")
 	tail := between(entry, "// BEGIN CUDA raw-hidden publication tail.", "// END CUDA raw-hidden publication tail.")
-	split := between(entry, "finishSplit := func() error {", "if err := c.qwen35SequenceReserveKVLocked")
+	split := between(entry, "finishSplit := func() error {", "// BEGIN sequence KV reservation.")
 	release := functions["qwen35SequenceReleaseSinceLocked"]
 	capability := functions["Qwen35SequenceRawHiddenPath"]
-	preflight := functions["validateQwen35SequenceRequestLocked"]
+	preflight := functions["validateQwen35SequenceStoreRequestLocked"]
 	gate := between(preflight[strings.Index(preflight, "{")+1:], "if req.CaptureRawHidden", "if err := validateQwen35SequenceGeometry(req)")
 	if release == "" || capability == "" {
 		t.Fatal("missing real lifetime/capability methods")
@@ -109,11 +109,12 @@ func TestCUDARawHiddenSourceLifetime(t *testing.T) {
 	// The only substitutions are the existing C boundary names/types, not Go
 	// ownership branches, failure cleanup, or release/keep logic.
 	tail = strings.NewReplacer("C.fcuda_d2d", "testD2D", "C.size_t", "uintptr",
+		"C.fcuda_rmsnorm_f32", "testRMSNorm", "C.float", "float32", "C.int", "int",
 		"C.fcuda_h2dxfer_bytes", "testH2D", "C.fcuda_hostxfer_bytes", "testD2H").Replace(tail)
 	program := cudaRawHiddenFixture + capability + "\n" + release + "\n" + bridge +
 		"\nfunc (c *cudaBackend) preflight(req Qwen35SequencePrefillRequest) (*cudaKV,error) {\n" + gate + "\nreturn nil,nil\n}\n" +
 		"func (c *cudaBackend) sequenceTail(req Qwen35SequencePrefillRequest) (result Qwen35SequencePrefillResult, err error) {\n" +
-		prefix + cudaRawHiddenTailSetup + split + tail + "\n}\n" + cudaRawHiddenControls
+		"var paged *rawHiddenUnselectedPaged\n" + prefix + cudaRawHiddenTailSetup + split + tail + "\n}\n" + cudaRawHiddenControls
 	t.Logf("production source %x; extracted host fixture %x", sha256.Sum256(source), sha256.Sum256([]byte(program)))
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "owner_test.go"), []byte(program), 0600); err != nil {
@@ -262,7 +263,7 @@ type cudaKV struct{}
 type cudaBackend struct {
 	transient []*cudaBuf; capturing bool; graphOnce *int; faultLatch *latch
 	fail string; block,privateStop bool; allocs, copies, fences, poisons int
-	fenceGen uint64; bridgeCalls,terminalCode int; originalRaw *cudaBuf
+	fenceGen uint64; bridgeCalls,terminalCode,normRows int; originalRaw *cudaBuf
 }
 type latch struct{ observed int }
 func(l *latch) ObserveError(error,string){l.observed++}
@@ -321,8 +322,11 @@ func(c *cudaBackend) qwen35SequenceAllocLocked(s []int,site string)(Tensor,*cuda
 func(c *cudaBackend) qwen35SequenceRMSNormLocked(x,w Tensor,tokens int,eps float32,site string)(Tensor,*cudaBuf,error){
 	if c.fail=="split-defer"{return Tensor{},nil,errors.New("primary norm allocation")}
 	if err:=c.maybe(site);err!=nil{return Tensor{},nil,err}
-	t,b:=c.make(x.Shape,site);for i,v:=range x.buf.data{b.data[i]=v*3};return t,b,nil
+	c.normRows+=tokens;t,b:=c.make(x.Shape,site);for i,v:=range x.buf.data{b.data[i]=v*3};return t,b,nil
 }
+func(c *cudaBackend)cf(t Tensor)*float32{if t.buf==nil{return nil};if t.buf.id=="raw"{if err:=c.maybe("raw-submit");err!=nil{panic(err)}};return (*float32)(t.buf.ptr)}
+// Explicit same arithmetic model as the full-panel fixture, not CUDA parity.
+func testRMSNorm(x,w,y *float32,rows,n int,eps float32){activeBackend.normRows+=rows;in,out:=unsafe.Slice(x,rows*n),unsafe.Slice(y,rows*n);for i,v:=range in{out[i]=v*3}}
 func(c *cudaBackend) qwen35SequenceMatMulLocked(w,x Tensor,tokens int,site string)(Tensor,*cudaBuf,error){
 	if err:=c.maybe(site);err!=nil{return Tensor{},nil,err}
 	t,b:=c.make([]int{tokens,w.Shape[0]},site);for i:=range b.data{b.data[i]=float32(i+11)};return t,b,nil
@@ -343,9 +347,15 @@ func(c *cudaBackend) releaseTransientBuffers(buffers []*cudaBuf){
 	for _,b:=range buffers{if b!=nil{b.ptr=nil}}
 	kept:=c.transient[:0];for _,b:=range c.transient{if b.ptr!=nil{kept=append(kept,b)}};c.transient=kept
 }
+type rawHiddenUnselectedPaged struct { executing,drained bool }
+func(*rawHiddenUnselectedPaged)abortLocked(){panic("raw-hidden fixture unexpectedly selected paged")}
+func(*rawHiddenUnselectedPaged)completeLocked()error{panic("raw-hidden fixture unexpectedly selected paged")}
 `
 
+// Paged is deliberately unselected in this contiguous raw-hidden witness. The
+// separate paged source witness executes the real selected ownership adapter.
 const cudaRawHiddenTailSetup = `
+var pagedControlH2D uint64
 tokens:=len(req.TokenIDs)
 x,xBuf:=c.make([]int{tokens,req.Hidden},"raw")
 for i:=range xBuf.data{xBuf.data[i]=float32(i+1)}
@@ -371,7 +381,9 @@ func TestRawLifetime(t *testing.T){
 		if c.fences!=1||c.poisons!=0||older.buf.ptr==nil{t.Fatal("fence/old owner changed")}
 		want:=2; if all{want++};if last{want++};if capture{want++}
 		if len(c.transient)!=want{t.Fatalf("survivors=%d want%d",len(c.transient),want)}
-		wantAlloc:=4;if all{wantAlloc++};if last{wantAlloc++};if c.allocs!=wantAlloc{t.Fatal("capture added an allocation")}
+		wantAlloc:=3;if all{wantAlloc+=2};if last{wantAlloc++};if c.allocs!=wantAlloc{t.Fatalf("output-tail allocations=%d want%d",c.allocs,wantAlloc)}
+		wantNormRows:=1;if all{wantNormRows=len(req.TokenIDs)};if c.normRows!=wantNormRows{t.Fatalf("normalized rows=%d want%d",c.normRows,wantNormRows)}
+		for i,v:=range got.LastHidden.buf.data{if v!=float32((len(req.TokenIDs)-1)*req.Hidden+i+1)*3{t.Fatal("normalized last row changed")}}
 		if capture{
 			raw:=got.RawHiddenRows
 			if raw.buf==nil||raw.buf.id!="raw"||raw.buf.ptr==nil||raw.buf.invalid!=0||len(raw.Shape)!=2||raw.Shape[0]!=3||raw.Shape[1]!=4{t.Fatal("not original live raw panel")}
@@ -397,15 +409,24 @@ func TestRawLifetime(t *testing.T){
 		})
 	}
 
+	// The last-row branch owns no normalized panel, including on failure.
+	for _,kind:=range []string{"last-hidden","output-head","fence","transfer-h","transfer-d"}{
+		t.Run("last-row-"+kind,func(t *testing.T){
+			c,req:=fixture();req.NeedAllLogits=false;c.fail=kind
+			got,err:=c.sequenceTail(req)
+			if err==nil||got.RawHiddenRows.buf!=nil||got.LastHidden.buf!=nil||c.poisons==0{t.Fatalf("last-row failure published: %+v %v",got,err)}
+			if c.originalRaw==nil||c.originalRaw.invalid==0{t.Fatal("last-row failure did not invalidate original residual")}
+		})
+	}
 	for _,all:=range []bool{false,true}{
 		c,req:=fixture();c.fail="split-ok";req.NeedAllLogits=all
 		got,err:=c.sequenceTail(req)
 		wantFences:=1;if all{wantFences=2}
 		if err!=nil||got.RawHiddenRows.buf!=c.originalRaw||c.originalRaw.ptr==nil||c.fences!=wantFences||c.fenceGen!=1||c.bridgeCalls!=0||c.block||c.privateStop{t.Fatal("successful actual split closure changed")}
 	}
-	for _,kind:=range []string{"panic-output-norm","goexit-output-norm","panic-output-head","goexit-output-head","panic-fence","goexit-fence"}{
+	for _,kind:=range []string{"panic-output-norm","goexit-output-norm","panic-output-head","goexit-output-head","panic-fence","goexit-fence","panic-raw-submit","goexit-raw-submit"}{
 		t.Run(kind,func(t *testing.T){
-			c,req:=fixture();c.fail=kind;c.block=true
+			c,req:=fixture();c.fail=kind;c.block=true;if strings.Contains(kind,"raw-submit"){req.NeedAllLogits=false}
 			done:=make(chan struct{});var recovered any;returned:=false
 			go func(){defer close(done);defer func(){recovered=recover()}();_,_=c.sequenceTail(req);returned=true}()
 			select{case<-done:case<-time.After(5*time.Second):t.Fatal("unwind hung")}

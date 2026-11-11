@@ -140,22 +140,26 @@ func perfDetailFromCompletion(comp *agent.Completion) perfDetail {
 	return d
 }
 
-// prefillRouteFromReceipt lifts the request's whole-sequence prefill route
-// decision off a native receipt. A receipt with no route block (a non-Qwen turn,
-// or a turn that made no eligible decision) yields nil, so the perf row omits the
-// field rather than fabricating a route.
+// prefillRouteFromReceipt preserves request-level completeness and qualification.
+// Status describes only the representative observed call, not every chunk.
+// Executed but unobserved calls remain present without invented route strings;
+// absent aggregates and aggregates with no executed calls are omitted.
 func prefillRouteFromReceipt(receipt *model.NativeInferenceReceipt) *perfledger.PrefillRoute {
-	if receipt == nil || receipt.Qwen35SequencePrefillRoute == nil || receipt.Qwen35SequencePrefillRoute.Status == nil {
+	if receipt == nil || receipt.Qwen35SequencePrefillRoute == nil || receipt.Qwen35SequencePrefillRoute.PrefillCalls <= 0 {
 		return nil
 	}
-	status := receipt.Qwen35SequencePrefillRoute.Status
-	return &perfledger.PrefillRoute{
-		RequestedPath:               status.RequestedPath,
-		EffectivePath:               status.EffectivePath,
-		DeclineReason:               status.DeclineReason,
-		FallbackActive:              status.FallbackActive,
-		NativePerformanceQualifying: status.NativePerformanceQualifying,
+	aggregate := receipt.Qwen35SequencePrefillRoute
+	route := &perfledger.PrefillRoute{
+		PrefillCalls:                aggregate.PrefillCalls,
+		ObservedCalls:               aggregate.ObservedCalls,
+		Complete:                    aggregate.Complete,
+		NativePerformanceQualifying: aggregate.NativePerformanceQualifying,
 	}
+	if status := aggregate.Status; status != nil {
+		route.RequestedPath, route.EffectivePath = status.RequestedPath, status.EffectivePath
+		route.DeclineReason, route.FallbackActive = status.DeclineReason, status.FallbackActive
+	}
+	return route
 }
 
 func completionBenchEvidence(comp *agent.Completion) *perfledger.BenchEvidence {
@@ -492,7 +496,10 @@ func (m *gatewayMetrics) perfRecordsSnapshot() ([]perfledger.Record, bool, uint6
 // SetPerfLedger installs the durable perf sink and seeds the in-memory ring
 // with prior history (oldest first) so the read survives a restart. seedCapped
 // reports that the seed was itself a bounded tail of a longer ledger. A nil sink
-// leaves the ring memory-only.
+// leaves the ring memory-only. With a non-nil sink it also opens the phase
+// receipt writer at the sink's sibling path, so the six-bucket breakdown is
+// durable alongside the latency axes; replacing the sink closes any previously
+// installed phase writer.
 func (s *Server) SetPerfLedger(sink *perfledger.Writer, seed []perfledger.Record, seedCapped bool) {
 	if s == nil || s.metrics == nil {
 		return
@@ -510,6 +517,27 @@ func (s *Server) SetPerfLedger(sink *perfledger.Writer, seed []perfledger.Record
 	}
 	m.perfMu.Unlock()
 	m.perfSink.Store(sink)
+	var pw *phaseLedgerWriter
+	if sink != nil {
+		pw = OpenPhaseLedgerWriter(PhaseLedgerSiblingPath(sink.Path()), perfledger.DefaultMaxBytes)
+	}
+	if prev := m.phaseSink.Swap(pw); prev != nil {
+		_ = prev.Close()
+	}
+}
+
+// ClosePhaseLedger flushes and closes the durable phase-receipt writer
+// installed by SetPerfLedger. Safe to call when none is installed or when the
+// default ledger was off.
+func (s *Server) ClosePhaseLedger() error {
+	if s == nil || s.metrics == nil {
+		return nil
+	}
+	pw := s.metrics.phaseSink.Swap(nil)
+	if pw == nil {
+		return nil
+	}
+	return pw.Close()
 }
 
 // PerfReport folds the last n retained per-request perf rows.

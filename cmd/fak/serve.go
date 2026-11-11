@@ -113,7 +113,9 @@ func configureServeToolEngines() {
 type serveFlags struct {
 	embeddingPooling             *string
 	topologyShadowInput          *string
+	workspaceAdmission           *string
 	workspaceAdmissionPermissive *bool
+	guard                        *bool
 	configPath                   *string
 	printEffectiveConfig         *bool
 	launchEvidencePath           *string
@@ -199,6 +201,9 @@ type serveFlags struct {
 	assumeSessionTurns           *int
 	elideResultBytes             *int
 	elideStaleReads              *bool
+	ctxPaging                    *string
+	chatElide                    *bool
+	modelPassthrough             *bool
 	sessionID                    *string
 	sessionStatePath             *string
 	sessionRegistry              *string
@@ -282,7 +287,9 @@ func newServeFlagSet() (*flag.FlagSet, *serveFlags) {
 	sf.printEffectiveConfig = fs.Bool("print-effective-config", false, "print supported effective serve configuration with value provenance, then exit without binding a listener")
 	sf.printFeatures = fs.Bool("print-features", false, "print the evaluated feature matrix and provenance before initialization, then exit without model I/O")
 	sf.addr = fs.String("addr", "127.0.0.1:8080", "HTTP listen address (OpenAI + fak + /mcp surface); ignored with --stdio")
-	sf.workspaceAdmissionPermissive = fs.Bool("workspace-admission-permissive", rwEnvBool("FAK_WORKSPACE_ADMISSION_PERMISSIVE"), "explicitly admit workspace lease DEFAULT_DENY failures with observable would_deny details; peer LEASE_HELD and kernel policy denies remain enforced (env: FAK_WORKSPACE_ADMISSION_PERMISSIVE)")
+	sf.workspaceAdmission = fs.String("workspace-admission", os.Getenv("FAK_WORKSPACE_ADMISSION"), "gateway lease-admission posture: open|permissive|strict (default: open — the gateway's own floor admits refused writes with would_deny forensic records after a kernel allow; permissive is the legacy lever (DEFAULT_DENY-class only, LEASE_HELD enforced); strict is the legacy shipped default where every lease-admission refusal stands. Kernel policy denials are never affected. env: FAK_WORKSPACE_ADMISSION)")
+	sf.workspaceAdmissionPermissive = fs.Bool("workspace-admission-permissive", rwEnvBool("FAK_WORKSPACE_ADMISSION_PERMISSIVE"), "legacy compat lever superseded by --workspace-admission (default open); true resolves the mode to permissive when no explicit mode is set (env: FAK_WORKSPACE_ADMISSION_PERMISSIVE)")
+	sf.guard = fs.Bool("guard", false, "arm the tool guard (adjudication + tool-result screening); default is raw pass-through")
 	sf.stdio = fs.Bool("stdio", false, "serve MCP over stdin/stdout (newline-delimited JSON-RPC) instead of HTTP")
 	sf.provider = fs.String("provider", "openai", "upstream provider transcript wire: openai, anthropic, gemini, or xai")
 	sf.armLeaseStore = fs.String("arm-lease-store", "", "private durable research-arm lease snapshot (Linux/Darwin; fresh store requires initial exclusive lease before inference)")
@@ -357,15 +364,18 @@ func newServeFlagSet() (*flag.FlagSet, *serveFlags) {
 	sf.ggufPath = fs.String("gguf", "", "load these GGUF weights into the in-kernel engine at boot; the load is part of the measured startup sequence and its phase breakdown is exposed on /metrics. Default path is lean-Q8 (Q4→f32→Q8 round-trip); set FAK_Q4K=1 for the direct-resident-Q4_K path (Qwen3.6-27B q4_k_m, the P1/P2 decode lever)")
 	sf.embeddingPooling = fs.String("embedding-pooling", "", "OPTIONAL learned causal dense-F32/Q8_0 CPU /v1/embeddings: mean or last, final norm + L2; empty keeps hash backend. Requires local compatible model/tokenizer; not trained embedding-quality qualification.")
 	sf.tokPath = fs.String("tokenizer", "", "OPTIONAL override for the in-kernel CHAT planner's tokenizer. With --gguf and no --base-url, /v1/chat/completions AND /v1/messages already serve the in-kernel model (real ChatML chat) using the GGUF's EMBEDDED tokenizer; pass this only to override it (e.g. an SPM-only checkpoint with no embedded BPE tokenizer, or a custom vocab). Accepts a tokenizer.json or its directory. e.g. ~/.cache/fak-models/tokenizers/qwen3.6")
-	sf.ctxViewBudget = fs.Int("ctx-view-budget", agent.DefaultCtxViewBudget, "wire the ctxplan context PLANNER into the live serve loop: each buffered turn, re-materialize the forwarded history as an O(1) planned VIEW under this resident-token budget (a planned view in place of appending the whole transcript, #555). DEFAULT-ON at a conservative 8000 resident tokens; pass 0 to disable (leaves the existing path byte-for-byte unchanged). The planner only ever SHORTENS and falls open to the full history on any doubt; on the Anthropic passthrough it keeps the cached prefix byte-identical (witness: docs/notes/CTXVIEW-DEFAULT-ON-WITNESS-2026-06-28.md). The streaming fast-path bypasses this; the buffered turn path is what gets planned.")
-	sf.compactHistoryBudget = fs.Int("compact-history-budget", gateway.DefaultCompactHistoryBudget, "on the Anthropic PASSTHROUGH (an upstream --base-url anthropic), compact OLD conversation turns in the OUTBOUND request body down to this resident-token budget while keeping the cache_control prefix BYTE-IDENTICAL, so the upstream cache hit survives. This reaches the flagship passthrough the streaming ctxplan view cannot (#555). DEFAULT-ON: once a conversation sprawls past ~48k resident tokens the cut fires and sheds the un-cacheable middle the provider re-bills every turn; a typical short session stays untouched. Pass 0 to disable (body forwarded byte-for-byte). No effect on non-passthrough wires.")
+	sf.ctxViewBudget = fs.Int("ctx-view-budget", gateway.DefaultServeCtxViewBudget, "wire the ctxplan context PLANNER into the live serve loop: each buffered turn, re-materialize the forwarded history as an O(1) planned VIEW under this resident-token budget (a planned view in place of appending the whole transcript, #555). DEFAULT-OFF on the serving router (gateway.DefaultServeCtxViewBudget, the 2026-11-10 hosting-simplification flip: the forwarded history is byte-for-byte); pass a budget (the guard door's legacy default is 8000, agent.DefaultCtxViewBudget) to re-arm. The planner only ever SHORTENS and falls open to the full history on any doubt; on the Anthropic passthrough it keeps the cached prefix byte-identical (witness: docs/notes/CTXVIEW-DEFAULT-ON-WITNESS-2026-06-28.md). The streaming fast-path bypasses this; the buffered turn path is what gets planned.")
+	sf.compactHistoryBudget = fs.Int("compact-history-budget", gateway.DefaultServeCompactHistoryBudget, "on the Anthropic PASSTHROUGH (an upstream --base-url anthropic), compact OLD conversation turns in the OUTBOUND request body down to this resident-token budget while keeping the cache_control prefix BYTE-IDENTICAL, so the upstream cache hit survives. This reaches the flagship passthrough the streaming ctxplan view cannot (#555). DEFAULT-OFF on the serving router (gateway.DefaultServeCompactHistoryBudget, the 2026-11-10 hosting-simplification flip: the body is forwarded byte-for-byte); pass a budget (the guard door's legacy default is 48000, gateway.DefaultCompactHistoryBudget) to re-arm. No effect on non-passthrough wires.")
 	sf.positiveResidualSubstitution = fs.Bool("positive-residual-substitution", false, "replace compacted negated/stale history with its positive residual; original bytes remain available through ctxrestore (default off)")
 	sf.compactAnchorHead = fs.Bool("compact-anchor-head", true, "re-anchor --compact-history-budget's protected prefix on the stable system/tools head instead of the first-breakpoint anchor, fixing the anchor-starved trap (#1407) where real Claude Code traffic's recent cache_control breakpoint protects almost the whole conversation so the budget can never shed anything. DEFAULT-ON, and every fire stays gated on the burst economics (CacheBurstPaysBack, #1408): a WARM session with no bounded turns budget never bursts — it fires only when a wired session-turn horizon repays the one-time burst, or when the trace OBSERVABLY idled past the message-breakpoint cache TTL since its last served turn (a penalty-free cut, the long-session firing path). Pass =false to pin the old warm-only first-breakpoint anchor.")
 	sf.assumeSessionTurns = fs.Int("assume-session-turns", gateway.DefaultAssumedSessionTurns, "the session length the head-anchored burst gate (--compact-anchor-head) ASSUMES when no bounded turn horizon is wired, so a WARM continuously-active long session sheds early instead of waiting to idle past the message-span cache TTL. The gate maps the trace's real served-turn depth to CurrentTurn and this value to TotalTurns: it fires early (many repaying turns left) and refuses near the presumed end — the same one-time-burst break-even economics (agent.CacheBurstPaysBack, #1408), just given a history-based length instead of refusing outright. DEFAULT-ON at gateway.DefaultAssumedSessionTurns; a genuine wired Budget.TurnsLeft horizon always WINS over this prior, and a large invalidated suffix still refuses regardless. Pass 0 to disable (byte-for-byte the conservative no-horizon behavior — no fire unless the burst is zero-penalty). Consulted only when --compact-anchor-head is on and the head re-anchor engages; inert on every other path.")
-	sf.elideResultBytes = fs.Int("elide-result-bytes", gateway.DefaultElideResultBytes, "ON by default at gateway.DefaultElideResultBytes (the reviewed gateway.DocumentedElideResultBytes threshold): shrink oversized tool_result bodies outside the active working set to a bounded head+tail form once they exceed this byte threshold. 0 disables.")
-	sf.elideStaleReads = fs.Bool("elide-stale-reads", gateway.DefaultElideStaleReads, "ON by default (gateway.DefaultElideStaleReads): replace a Read tool_result whose file was Edited/Written in a LATER in-session turn (a stale, superseded snapshot no longer reflecting disk) with a compact fak_context_restore marker, in the SAME cache-safe working-set band as --elide-result-bytes and stashing the pre-edit body behind a restore handle. The safer, restorable sibling of --elide-result-bytes: strictly more conservative predicate (superseded, not merely big), fail-safe identity on any ambiguity, protected cache prefix proven byte-identical. Size-independent; lossy but restorable. Pass =false to opt out. No effect on non-passthrough wires.")
-	sf.vcacheAnchor = fs.Bool("vcache-anchor", gateway.DefaultVCacheAnchor, "M2 star-anchor pre-flight gate (#1493): on the Anthropic passthrough (an upstream --base-url anthropic), APPLY cachemeta.RecommendLayout before send — hoist volatile system blocks behind a byte-stable cacheable anchor and splice a cache_control breakpoint onto the stable head a no-breakpoint caller did NOT send, so the first natural request warms provider prefix caching and later siblings read it. DEFAULT-ON, DECOUPLED from --compact-history-budget (that path only placed the anchor while its own budget was >0, so --compact-history-budget=0 silently took anchoring down with it). Fail-safe identity on any ambiguity — a hoist that would change the model-visible prefix is REFUSED, not applied — and idempotent with the compaction/TTL placements (a body already carrying a breakpoint bails already_set). Pass =false to opt out. No effect on non-passthrough wires.")
-	sf.deferColdTools = fs.Bool("defer-cold-tools", gateway.DefaultDeferColdTools, "the 10x floor lever (#3232, epic #3229): on the OUTBOUND Anthropic body, mark every allowed-but-COLD custom tool `defer_loading:true` and inject one `tool_search_tool`, so the provider loads only the HOT core into context and faults a cold schema in on demand. Deterministic + cache-safe (byte-stable tools[] turn-over-turn) and fail-safe identity on any ambiguity; every deferred def stays byte-complete in tools[], so a first real use still resolves. DEFAULT ON (gateway.DefaultDeferColdTools, the #3537 flip; the A/B and #3200 fault-in gates reported PASS). Pass =false to opt out; ablate an A/B arm with FAK_ABLATE_DEFER_TOOLS=1 (FAK_DEFER_COLD_TOOLS=1 still forces it on). Anthropic passthrough only.")
+	sf.elideResultBytes = fs.Int("elide-result-bytes", gateway.DefaultServeElideResultBytes, "shrink oversized tool_result bodies outside the active working set to a bounded head+tail form once they exceed this byte threshold. DEFAULT-OFF on the serving router (gateway.DefaultServeElideResultBytes, the 2026-11-10 hosting-simplification flip); the guard door keeps gateway.DefaultElideResultBytes (the reviewed gateway.DocumentedElideResultBytes threshold) — pass that value here to re-arm. 0 disables.")
+	sf.elideStaleReads = fs.Bool("elide-stale-reads", gateway.DefaultServeElideStaleReads, "replace a Read tool_result whose file was Edited/Written in a LATER in-session turn (a stale, superseded snapshot no longer reflecting disk) with a compact fak_context_restore marker, in the SAME cache-safe working-set band as --elide-result-bytes and stashing the pre-edit body behind a restore handle. The safer, restorable sibling of --elide-result-bytes: strictly more conservative predicate (superseded, not merely big), fail-safe identity on any ambiguity, protected cache prefix proven byte-identical. Size-independent; lossy but restorable. DEFAULT-OFF on the serving router (gateway.DefaultServeElideStaleReads, the 2026-11-10 hosting-simplification flip); the guard door keeps gateway.DefaultElideStaleReads (true). No effect on non-passthrough wires.")
+	sf.modelPassthrough = fs.Bool("model-passthrough", false, "forward the client's requested model to the upstream on the Anthropic /v1/messages wire instead of always sending --model (an omitted model still sends --model). Arm it when --base-url is itself a model router; off by default because this wire historically sent --model for every request")
+	sf.vcacheAnchor = fs.Bool("vcache-anchor", gateway.DefaultServeVCacheAnchor, "M2 star-anchor pre-flight gate (#1493): on the Anthropic passthrough (an upstream --base-url anthropic), APPLY cachemeta.RecommendLayout before send - hoist volatile system blocks behind a byte-stable cacheable anchor and splice a cache_control breakpoint onto the stable head a no-breakpoint caller did NOT send, so the first natural request warms provider prefix caching and later siblings read it. DEFAULT-OFF on the serving router (gateway.DefaultServeVCacheAnchor, the 2026-11-10 hosting-simplification flip: the outbound body is never re-anchored); the guard door keeps gateway.DefaultVCacheAnchor (true). Fail-safe identity on any ambiguity - a hoist that would change the model-visible prefix is REFUSED, not applied - and idempotent with the compaction/TTL placements (a body already carrying a breakpoint bails already_set). No effect on non-passthrough wires.")
+	sf.deferColdTools = fs.Bool("defer-cold-tools", gateway.DefaultServeDeferColdTools, "the 10x floor lever (#3232, epic #3229): on the OUTBOUND Anthropic body, mark every allowed-but-COLD custom tool `defer_loading:true` and inject one `tool_search_tool`, so the provider loads only the HOT core into context and faults a cold schema in on demand. Deterministic + cache-safe (byte-stable tools[] turn-over-turn) and fail-safe identity on any ambiguity; every deferred def stays byte-complete in tools[], so a first real use still resolves. DEFAULT-OFF on the serving router (gateway.DefaultServeDeferColdTools, the 2026-11-10 hosting-simplification flip: the client's tools[] passes through untouched); the guard door keeps gateway.DefaultDeferColdTools (true, the #3537 flip). Ablate an A/B arm with FAK_ABLATE_DEFER_TOOLS=1 (FAK_DEFER_COLD_TOOLS=1 still forces it on). Anthropic passthrough only.")
+	sf.ctxPaging = fs.String("ctx-paging", gateway.DefaultServeCtxPaging, "the oversize tool-result PAGING posture on the chat/responses wires: on|off|auto (env: FAK_CTX_PAGING; the per-request X-Fak-Ctx-Paging header wins over both). off (the serving-router default, gateway.DefaultServeCtxPaging, the 2026-11-10 hosting-simplification flip) never pages: a tool result reaches the model whole and byte-identical, no restore stub is created. auto (the guard door's legacy default) pages an oversize-but-benign result only when the client can restore the stub; on pages regardless.")
+	sf.chatElide = fs.Bool("chat-elide", gateway.DefaultServeChatToolResultElide == gateway.ChatToolResultElideOn, "arm the chat/responses tool-result ELISION: rewrite an old oversized tool result beyond the active working set into a \"...[fak: tool output elided ... recover via fak_context_restore id=sha256:...]\" marker (threshold: FAK_RESPONSES_ELIDE_THRESHOLD, default 16 KiB) and auto-advertise the restore tool to clients carrying fak MCP tools. DEFAULT-OFF on the serving router (gateway.DefaultServeChatToolResultElide, the 2026-11-10 hosting-simplification flip: the client's declared tools pass through byte-identical and nothing is rewritten); the guard door keeps the elider armed. env: FAK_CHAT_ELIDE.")
 	sf.deferTools = fs.Bool("defer-tools", true, "defer cold MCP tools on tools/list (default true); pass --defer-tools=false to advertise the full tool registry on tools/list (required for harnesses like OpenCode that do not support dynamic runtime tool paging)")
 	sf.toolCeiling = fs.Int("tool-ceiling", gateway.DefaultMCPToolAdvertisementCeiling, "ceiling on advertised MCP tools on tools/list when deferral is disabled (default 10); clamps the advertised set to a curated active set to limit token overhead; 0 for unbounded")
 	sf.sessionID = fs.String("session-id", "", "default trace/session id for callers that omit X-Trace-Id or MCP trace_id (empty = mint gw-N per request unless --context-budget-tokens is set)")
@@ -427,7 +437,7 @@ func newServeFlagSet() (*flag.FlagSet, *serveFlags) {
 	sf.nativeSpeculate = fs.Bool("native-speculate", false, "enable effect-free coding speculation. Requires --native-code-workspace.")
 	sf.vdsoProxyFill = fs.Bool("vdso-proxy-fill", false, "warm vDSO from admitted inbound tool_result blocks. Off by default — sound only when the principal is named and writes that touch the same resource reach fak (a proxy-closed world), so it is an explicit operator opt-in. Scoped per-principal; never fills a Shareable or write-shaped tool.")
 	sf.metricsSnapshot = fs.Duration("metrics-snapshot", 0, "periodically append an interim gateway-usage counter snapshot (internal/gatewayusageledger, .fak/nightrun/gateway-usage.jsonl) while this long-lived `fak serve` is up, so a crash before a clean exit still leaves a trail (#1610). 0 (default) disables periodic snapshots; the exit-time snapshot is always written regardless of this flag.")
-	sf.perfLedger = fs.String("perf-ledger", "", "durable per-request serving-performance ledger (TTFT/prefill/decode/e2e/cache per served turn, internal/perfledger). Empty (default) = .fak/nightrun/gateway-perf.jsonl under the nightrun ledger root; \"off\" disables the file (the in-memory /v1/fak/perf/recent ring stays on). Appended asynchronously off the request path, rotated at 16 MiB to <path>.1; read it with `fak perf`.")
+	sf.perfLedger = fs.String("perf-ledger", "", "durable per-request serving-performance ledger (TTFT/prefill/decode/e2e/cache per served turn, internal/perfledger). Empty (default) = .fak/nightrun/gateway-perf.jsonl under the nightrun ledger root; \"off\" disables the file (the in-memory /v1/fak/perf/recent ring stays on). Native per-request phase receipts persist beside it as <path>.phases.jsonl (gateway-perf.phases.jsonl by default), the --phases input of `fak model-observe time-burndown`. Appended asynchronously off the request path, rotated at 16 MiB to <path>.1; read it with `fak perf`.")
 	sf.fleetBus = fs.Bool("fleet-bus", false, "JOIN THE FLEET CONTROL BUS (#5600, epic #5599): announce this serve as a control-plane instance on the shared bus and drain directives from it every --fleet-bus-interval, so one `fak fleet control send` reaches every live instance at once — the cross-PROCESS fan-out the per-gateway `sessionctl` broadcast and the display-only `fleetspine` each stop short of. Each drained directive is applied through the SAME writes the single-session verbs ride (steer ⇒ the a2achan operator turn, needs --native; pause/resume/cancel/terminate/throttle ⇒ session.Table.Transition) and every one draws an ACK carrying what this process OBSERVED change — the return path that lets the control point say \"3 of 4 applied, 1 refused STEER_NO_OWNED_LOOP\" instead of \"sent\". Exactly-once under at-least-once redelivery is keyed by the instance identity: the default fixed HTTP listen address survives a restart and remains distinct from simultaneous serves on other addresses; --stdio, --addr :0, or an unusable address fall back to a process-local identity and therefore do not promise restart dedup. Off by default (arming a control plane must be stated); the bus directory is --fleet-bus-dir.")
 	sf.fleetBusDir = fs.String("fleet-bus-dir", "", "with --fleet-bus: the shared bus directory (default: FAK_FLEET_BUS, else <FLEET_STATE_DIR>/bus, else beside the fleet registry). On one machine a directory IS a real cross-process control plane; it is an honest cross-HOST one only where the directory itself is shared (a UNC path, an SMB/NFS mount) — which is what FLEET_STATE_DIR already exists to point at.")
 	sf.fleetBusID = fs.String("fleet-bus-id", "", "with --fleet-bus: explicit stable bus identity override. Empty derives a restart-stable id from this machine plus the fixed HTTP listen address; --stdio, --addr :0, or an unusable address use a process-local fallback. A configured name is preserved (after bus-token sanitization) and must be unique among simultaneously live serves unless deliberately sharing one apply claim.")
@@ -477,6 +487,80 @@ func resolveSpeculativeMode(flagValue string, getenv func(string) string) (strin
 	default:
 		return "", fmt.Errorf("%w: %q (admitted: mtp, ngram, dflash2, empty)", ErrSpeculativeModeUnknown, effective)
 	}
+}
+
+// resolveServeToolGuard maps the --guard flag + FAK_GUARD env onto the gateway
+// ToolGuard posture. The DEFAULT is raw pass-through (off): the router is an
+// inference pipe with zero interception processing unless the operator arms the
+// guard. An explicitly passed --guard wins over the env; an explicit
+// FAK_GUARD wins over the flag default; an unparsable FAK_GUARD fails loud
+// (a misconfigured security boundary never silently resolves).
+func resolveServeToolGuard(guard bool, explicit map[string]bool, getenv func(string) string) (string, error) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	if explicit != nil && explicit["guard"] {
+		if guard {
+			return gateway.ToolGuardOn, nil
+		}
+		return gateway.ToolGuardOff, nil
+	}
+	if raw := strings.TrimSpace(getenv("FAK_GUARD")); raw != "" {
+		mode, err := gateway.ParseToolGuardMode(raw)
+		if err != nil {
+			return "", fmt.Errorf("FAK_GUARD: %v", err)
+		}
+		return mode, nil
+	}
+	return gateway.ToolGuardOff, nil
+}
+
+// resolveServeCtxPaging maps the --ctx-paging flag + FAK_CTX_PAGING env onto the
+// gateway CtxPaging posture. The DEFAULT is off: the serving router does not page
+// tool results into {"_paged":true} restore stubs (the 2026-11-10 hosting-
+// simplification flip). An explicitly passed --ctx-paging wins over the env; an
+// explicit FAK_CTX_PAGING wins over the flag default; an unparsable value fails
+// loud (a context rewriter never silently resolves).
+func resolveServeCtxPaging(paging string, explicit map[string]bool, getenv func(string) string) (string, error) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	if explicit != nil && explicit["ctx-paging"] {
+		return gateway.ParseCtxPagingMode(paging)
+	}
+	if raw := strings.TrimSpace(getenv("FAK_CTX_PAGING")); raw != "" {
+		mode, err := gateway.ParseCtxPagingMode(raw)
+		if err != nil {
+			return "", fmt.Errorf("FAK_CTX_PAGING: %v", err)
+		}
+		return mode, nil
+	}
+	return gateway.DefaultServeCtxPaging, nil
+}
+
+// resolveServeChatToolResultElide maps the --chat-elide flag + FAK_CHAT_ELIDE env
+// onto the gateway ChatToolResultElide posture. The DEFAULT is off: the serving
+// router does not rewrite old tool results and does not auto-advertise the
+// restore tool (the same hosting-simplification flip). Precedence matches the
+// tool guard: explicit flag > explicit env > the off default; unparsable fails loud.
+func resolveServeChatToolResultElide(elide bool, explicit map[string]bool, getenv func(string) string) (string, error) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	if explicit != nil && explicit["chat-elide"] {
+		if elide {
+			return gateway.ChatToolResultElideOn, nil
+		}
+		return gateway.ChatToolResultElideOff, nil
+	}
+	if raw := strings.TrimSpace(getenv("FAK_CHAT_ELIDE")); raw != "" {
+		mode, err := gateway.ParseChatToolResultElideMode(raw)
+		if err != nil {
+			return "", fmt.Errorf("FAK_CHAT_ELIDE: %v", err)
+		}
+		return mode, nil
+	}
+	return gateway.DefaultServeChatToolResultElide, nil
 }
 
 // serveDFlash2SidecarDecision resolves the per-load DFlash2 sidecar retention
@@ -1355,8 +1439,57 @@ func (rt *serveRuntime) buildGateway(sf *serveFlags) (result *gateway.DurableCon
 		return nil, err
 	}
 
+	// Gateway lease-admission posture (--workspace-admission): an explicit mode
+	// (flag or FAK_WORKSPACE_ADMISSION) wins; the legacy permissive bool resolves
+	// to permissive; otherwise the going-forward open default. An unknown token
+	// already failed loud at flag-parse time; New re-validates defensively.
+	wsAdmissionMode, err := resolveWorkspaceAdmission(*sf.workspaceAdmission, *sf.workspaceAdmissionPermissive)
+	if err != nil {
+		return nil, err
+	}
+
+	// Tool-guard posture (--guard / FAK_GUARD): the serve default is RAW PASS-THROUGH
+	// (off) — the router is an inference pipe with zero interception processing unless
+	// the operator arms the guard by name. An explicitly passed --guard wins over
+	// FAK_GUARD; an unparsable FAK_GUARD fails loud here instead of booting with a
+	// silently-resolved security posture. The resolved posture is stated on the
+	// startup banner so the served surface can never disagree about its own floor.
+	toolGuardMode, err := resolveServeToolGuard(*sf.guard, rt.explicitFlags, os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	if toolGuardMode == gateway.ToolGuardOn {
+		startupMessages = append(startupMessages, gateway.StartupMessage{Source: "serve", Kind: "tool-guard", Level: "info", Text: "tool guard: on — tool-call adjudication + tool-result screening armed"})
+	} else {
+		startupMessages = append(startupMessages, gateway.StartupMessage{Source: "serve", Kind: "tool-guard", Level: "info", Text: "tool guard: off — raw pass-through (arm with --guard or FAK_GUARD=on)"})
+	}
+
+	// Context-plane postures (--ctx-paging / FAK_CTX_PAGING, --chat-elide /
+	// FAK_CHAT_ELIDE): the serve default is RAW CONTEXT — no oversize paging, no
+	// tool-result elision, no restore-tool auto-advertisement, and the per-lever
+	// serving flags (--ctx-view-budget, --compact-history-budget, --elide-*)
+	// default to their off values. Each lever re-arms by name; an unparsable
+	// posture fails loud here instead of booting with a silently-rewriting plane.
+	ctxPagingMode, err := resolveServeCtxPaging(*sf.ctxPaging, rt.explicitFlags, os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	chatElideMode, err := resolveServeChatToolResultElide(*sf.chatElide, rt.explicitFlags, os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+	if ctxPagingMode == gateway.CtxPagingOff && chatElideMode == gateway.ChatToolResultElideOff {
+		startupMessages = append(startupMessages, gateway.StartupMessage{Source: "serve", Kind: "context-plane", Level: "info", Text: "context plane: raw — no oversize paging, no tool-result elision, no restore-tool injection (re-arm with --ctx-paging on / --chat-elide / the --elide-* and --compact-* levers)"})
+	} else {
+		startupMessages = append(startupMessages, gateway.StartupMessage{Source: "serve", Kind: "context-plane", Level: "info", Text: "context plane: armed — oversize paging " + ctxPagingMode + ", tool-result elision " + chatElideMode})
+	}
+
 	srv, err := gateway.New(gateway.Config{
+		WorkspaceAdmission:           wsAdmissionMode,
 		WorkspaceAdmissionPermissive: *sf.workspaceAdmissionPermissive,
+		ToolGuard:                    toolGuardMode,
+		CtxPaging:                    ctxPagingMode,
+		ChatToolResultElide:          chatElideMode,
 		EngineID:                     *sf.engineID,
 		OTLPEndpoint:                 *sf.otlpEndpoint,
 		OrgAudit:                     orgAudit,
@@ -1418,6 +1551,7 @@ func (rt *serveRuntime) buildGateway(sf *serveFlags) (result *gateway.DurableCon
 		AssumeSessionTurns:           *sf.assumeSessionTurns,
 		ElideResultBytes:             *sf.elideResultBytes,
 		ElideStaleReads:              *sf.elideStaleReads,
+		ModelPassthrough:             *sf.modelPassthrough,
 		// M2 star-anchor pre-flight gate (#1493): DEFAULT-ON (--vcache-anchor), DECOUPLED
 		// from CompactHistoryBudget so --compact-history-budget=0 no longer takes anchoring
 		// down with it. Applies cachemeta.RecommendLayout on the Anthropic passthrough;

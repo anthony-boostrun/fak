@@ -156,6 +156,8 @@ func dispatchCoreVerbA(name string, args []string) bool {
 		cmdRecover(args)
 	case "concept":
 		os.Exit(runConceptCLI(os.Stdout, os.Stderr, args))
+	case "conceptdrift":
+		cmdConceptDrift(args)
 	case "completion":
 		cmdCompletion(args)
 	case "compute":
@@ -566,6 +568,8 @@ func dispatchExtendedVerbA(name string, args []string) bool {
 		cmdWebbench(args)
 	case "ailuminate":
 		cmdAILuminate(args)
+	case "hwspecs":
+		cmdHWSpecs(args)
 	case "model":
 		cmdModel(args)
 	case "model-default":
@@ -1014,6 +1018,8 @@ func dispatchPrimaryVerb(name string, args []string, start time.Time, verb *stri
 	case "ablate-arm":
 		// Hidden internal seam: the ablate arm-mode re-exec child (see cmdAblateArm).
 		cmdAblateArm(args)
+	case "optimize":
+		cmdOptimize(args)
 	case "turntax":
 		if len(args) > 0 && args[0] == "visual" {
 			cmdTurnTaxVisual(args[1:])

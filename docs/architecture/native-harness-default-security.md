@@ -6,12 +6,13 @@ description: "What the fak native harness gives you by default — the capabilit
 # Native harness default-on security features
 
 The fak native harness is not a blank agent loop you bolt policy onto. It ships a
-security substrate that is **on by default** at the call boundary: a default-deny
-capability floor, a write-time result gate that pages poison out of context, a
-just-in-time credential path that keeps secrets out of the model context and off
-the wire, kernel-authored provenance, and effect-verify witness gates. This page
-collects the features a builder inherits for free and names the `pkg/harnesskit`
-contracts that expose the same posture to external products.
+security substrate that is **on by default** at the call boundary: a default-open
+capability floor whose provable-refusal rungs still hold, a write-time result gate
+that pages poison out of context, a just-in-time credential path that keeps secrets
+out of the model context and off the wire, kernel-authored provenance, and
+effect-verify witness gates. This page collects the features a builder inherits for
+free and names the `pkg/harnesskit` contracts that expose the same posture to
+external products.
 
 > **Read the honest scope.** As with [docs/fak/security.md](../fak/security.md) and
 > the [threat model FAQ](../faq/security-threat-model.md): the load-bearing
@@ -26,7 +27,7 @@ contracts that expose the same posture to external products.
 
 | Feature | Default | Where it lives | What it buys you |
 |---|---|---|---|
-| **Capability floor** | default-deny allow-list | `internal/adjudicator/default_policy.go` `DefaultPolicy` / `DevAgentPolicy` | an irreversible tool never allow-listed is refused regardless of context |
+| **Capability floor** | default-open (provable-refusal rungs hold) | `internal/adjudicator/default_policy.go` `DefaultPolicy` / `DevAgentPolicy` | an unlisted tool is admitted by default; the named deny map, self-modify globs, dangerous-gotcha floor, credential block, egress, and arg rules still refuse regardless of posture. Set `posture: fail_closed` in the manifest for the stricter blanket-deny floor |
 | **Result quarantine** (write-time gate) | on (rank 5, `FAK_NORMGATE!=off`) | `internal/normgate/normgate.go` | a poisoned/injection result is paged out to a stub before it can enter context |
 | **Secret handling** | warn-first redact (opt-in hard seal) | `normgate.admitSecret` → `internal/canon` `RedactSecrets` | the credential span is masked in place; the rest of the output stays in context |
 | **JIT secret paging** (harnesskit) | declared per tool, resolved at the execution boundary | `pkg/harnesskit/tool.go` `AuthBinding` / `SecretStore` | secrets never enter model context or serialized tool parameters |
@@ -36,6 +37,7 @@ contracts that expose the same posture to external products.
 | **Plan CFI** | plan control-flow integrity adjudicator | `internal/plancfi` | a plan that drifts from its approved shape raises `RequireApproval` |
 | **Durable-memory gate** | expire-by-default promotion | `internal/ctxmmu` `GateEphemeral`, `disposition.go` | a situational fact cannot silently become a standing belief |
 | **KV/context containment** | quarantined taint refused for attention | `internal/ctxmmu`, `internal/contextq` | a quarantined span is mechanically denied to attention |
+| **Gateway lease admission** | open admit-and-log (`would_deny` records; kernel floor untouched) | `internal/gateway/tool_routing.go` (`adjudicateLeaseAdmission`) | after a kernel ALLOW/TRANSFORM, the gateway's own workspace-ownership floor refuses nothing by default: DEFAULT_DENY-class refusals AND peer `LEASE_HELD` conflicts are admitted with `would_deny` forensic detail (`By: lease-admission-open`). Kernel policy denials stand in every mode — lease admission only runs after a kernel allow. `--workspace-admission permissive` keeps peer `LEASE_HELD` enforced; `strict` enforces every refusal (the legacy shipped default) |
 
 Each row has a witness test in its package; the consolidated claim is
 `docs/claims/security-substrate-the-kernel-stops-believing-the-model.md`.
@@ -139,10 +141,20 @@ The normative contracts are `PublicContract()` / `ContractJSON()`
 
 - **Default-on, no action required:** normgate runs at rank 5 in front of ctxmmu
   (one blank import); the default floor is the registered `adjudicator.Default`.
+- **Gateway lease admission posture** (`fak serve` / `fak guard`, env
+  `FAK_WORKSPACE_ADMISSION`): `--workspace-admission open|permissive|strict`
+  selects what the gateway's OWN workspace-ownership floor does with a refused
+  write after the kernel allowed the call — `open` (default) admits-and-logs
+  DEFAULT_DENY-class and peer `LEASE_HELD` refusals with `would_deny` records;
+  `permissive` (the legacy lever, also reachable via
+  `--workspace-admission-permissive`) admits DEFAULT_DENY-class only; `strict`
+  enforces every refusal. The built-in kernel floor is untouched by all three
+  modes; a custom/strict floor stays an operator lever (`--policy`).
 - **Tighten:** supply a reviewed `--policy` (never the bare default in prod);
   keep irreversible tools off the allow-list; add `arg_rules` /
   `self_modify_globs`; opt into the fail-closed secret posture for unattended
-  contexts.
+  contexts; select `--workspace-admission strict` to stand the gateway's own
+  lease-admission floor back up.
 - **Escape hatches (blunt, reversible, per-process):**
   - `FAK_NORMGATE=off` makes `Admit` a no-op `Defer` (also disables the
     injection screen — a dev escape hatch, not a prod posture).

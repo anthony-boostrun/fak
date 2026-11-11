@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/anthony-chaudhary/fak/internal/compute"
 	"github.com/anthony-chaudhary/fak/internal/ggufload"
@@ -229,12 +230,17 @@ const (
 // serveExpertRingSizing is the size choice and every input it was made from, for the log line.
 type serveExpertRingSizing struct {
 	Mode serveExpertRingMode
-	// Binding is the bound an auto ring took; none for token, explicit and unmeasured auto.
+	// Binding is the bound that set the ring: the chosen bound for an auto ring, the band ceiling
+	// for an explicit ring it clamped down, and none for token, unclamped explicit and unmeasured
+	// auto.
 	Binding    serveExpertRingBinding
 	RingBytes  int64
 	TokenBytes int64
 	Floor      int64
 	Ceiling    int64
+	// ClampedFrom is the operator-requested --expert-ring-bytes when the routed band ceiling
+	// clamped an explicit ring down; 0 when the ring was not clamped.
+	ClampedFrom int64
 	// DeviceBound / HostBound are the room each bound leaves the ring; Known=false when the
 	// bound could not be measured and did not constrain the choice.
 	DeviceBound, HostBound           int64
@@ -325,6 +331,10 @@ func sizeServeExpertRing(size serveExpertRingSize, f ggufload.ActivatedExpertFit
 		s.Binding = binding
 	case serveExpertRingExplicit:
 		s.RingBytes = min(size.Bytes, s.Ceiling)
+		if s.Ceiling > 0 && s.RingBytes < size.Bytes {
+			// The band ceiling set the ring: name the bound that chose it, like the auto path.
+			s.Binding, s.ClampedFrom = serveExpertRingBindingBand, size.Bytes
+		}
 	default:
 		return s, fmt.Errorf("%w: mode %q", ErrServeExpertRingSize, size.Mode)
 	}
@@ -373,7 +383,7 @@ func (s serveExpertRingSizing) Text() string {
 	if s.HostDefaultAuto {
 		mode += " default=auto (high-RAM host)"
 	}
-	return fmt.Sprintf("ring size mode=%s binding=%s chosen=%s token=%s floor=%s band=%s device_bound=%s (device_avail=%s non_ring_device=%s) host_bound=%s (mem_available=%s rss_anon_peak=%s margin=%s non_ring_host=%s shared_pool=%t) pool_cap=%s guard_trim=%s host_gathered=%s page_reserve=%s",
+	text := fmt.Sprintf("ring size mode=%s binding=%s chosen=%s token=%s floor=%s band=%s device_bound=%s (device_avail=%s non_ring_device=%s) host_bound=%s (mem_available=%s rss_anon_peak=%s margin=%s non_ring_host=%s shared_pool=%t) pool_cap=%s guard_trim=%s host_gathered=%s page_reserve=%s",
 		mode, binding, bytesText(uint64(max(s.RingBytes, 0))), bytesText(uint64(max(s.TokenBytes, 0))),
 		bytesText(uint64(max(s.Floor, 0))), bytesText(uint64(max(s.Ceiling, 0))),
 		bound(s.DeviceBound, s.DeviceBoundKnown), bytesText(uint64(max(s.DeviceAvail, 0))), bytesText(uint64(max(s.NonRingDevice, 0))),
@@ -382,6 +392,10 @@ func (s serveExpertRingSizing) Text() string {
 		s.poolCapText(),
 		bytesText(uint64(max(s.GuardTrimBytes, 0))),
 		bytesText(uint64(max(s.HostGatheredBytes, 0))), bytesText(uint64(max(s.HostGatheredReserve, 0))))
+	if s.ClampedFrom > 0 {
+		text += fmt.Sprintf(" clamped_from=%s (--%s)", bytesText(uint64(s.ClampedFrom)), serveExpertRingBytesFlag)
+	}
+	return text
 }
 
 func (s serveExpertRingSizing) poolCapText() string {
@@ -450,13 +464,84 @@ func reportDroppedExpertRing(arm string, getenv func(string) string) error {
 // enableServeSharedExpertRing gives the loaded model ONE routed-expert ring for the serve's
 // backend, so every request attaches to the same residency instead of building and freeing a
 // fresh ring: an expert paged in by request N is a hit for request N+1, and concurrent sessions
-// share one budget instead of overcommitting it N times.
-func enableServeSharedExpertRing(m *fakmodel.Model, be compute.Backend) error {
+// share one budget instead of overcommitting it N times. sizing selects the scan-resistant stable
+// set (serveExpertRingStableBytes); the ring's own hit/page-in ledger is logged while it moves.
+func enableServeSharedExpertRing(m *fakmodel.Model, be compute.Backend, sizing serveExpertRingSizing, getenv func(string) string) error {
 	if m == nil || be == nil {
 		return nil
 	}
-	if _, err := m.EnableSharedExpertRing(be); err != nil {
+	stable := serveExpertRingStableBytes(sizing, getenv)
+	sh, err := m.EnableSharedExpertRingWith(be, fakmodel.SharedExpertRingOptions{StableBytes: stable})
+	if err != nil {
 		return fmt.Errorf("fak serve: model-scoped activated-expert ring: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "fak serve: activated-expert ring stable set=%s of ring=%s band=%s (%s=off disables)\n",
+		bytesText(uint64(max(stable, 0))), bytesText(uint64(max(sizing.RingBytes, 0))), bytesText(uint64(max(sizing.Ceiling, 0))), FakExpertRingStableEnv)
+	go reportServeExpertRingStats(sh, serveExpertRingStatsEvery)
 	return nil
+}
+
+// FakExpertRingStableEnv controls the ring's scan-resistant stable set: "off"/"0" disables it,
+// "on"/"1" enables it for any non-token ring smaller than the band, unset is the size-gated default.
+const FakExpertRingStableEnv = "FAK_EXPERT_RING_STABLE"
+
+const (
+	// serveExpertRingStableMinRing gates the default stable set to big rings (large-HBM GPUs);
+	// smaller rings keep the historical plain LRU unless FAK_EXPERT_RING_STABLE=on.
+	serveExpertRingStableMinRing int64 = 32 << 30
+	// serveExpertRingStableChurnFloor is the least LRU churn room left beside the stable set, for
+	// live hold spans, grouped prefill panels and non-stable experts.
+	serveExpertRingStableChurnFloor int64 = 8 << 30
+	serveExpertRingStatsEvery             = 30 * time.Second
+)
+
+// serveExpertRingStableBytes sizes the stable set: ring - max(ring/4, churn floor), and 0 when the
+// ring is token-sized, already holds the whole band (nothing to thrash), or is below the default gate.
+func serveExpertRingStableBytes(s serveExpertRingSizing, getenv func(string) string) int64 {
+	mode := strings.ToLower(strings.TrimSpace(getenv(FakExpertRingStableEnv)))
+	if mode == "off" || mode == "0" || mode == "false" {
+		return 0
+	}
+	ring := s.RingBytes
+	if s.Mode == serveExpertRingToken || ring <= 0 || (s.Ceiling > 0 && ring >= s.Ceiling) {
+		return 0
+	}
+	forced := mode == "on" || mode == "1" || mode == "true"
+	if !forced && ring < serveExpertRingStableMinRing {
+		return 0
+	}
+	stable := ring - max(ring/4, min(serveExpertRingStableChurnFloor, ring/2))
+	return max(stable, 0)
+}
+
+// serveExpertRingStatsText renders the ring's own ledger — the device-ring hit rate the per-request
+// hit_fraction (the host checkpoint-tier ledger) never measures.
+func serveExpertRingStatsText(st fakmodel.SharedExpertRingStats) string {
+	r := st.Ring
+	hit := "n/a"
+	if n := r.Hits + r.PageIns; n > 0 {
+		hit = strconv.FormatFloat(float64(r.Hits)/float64(n), 'f', 3, 64)
+	}
+	return fmt.Sprintf("expert_ring hit_fraction=%s hits=%d page_ins=%d evictions=%d refusals=%d page_in_bytes=%d resident=%s/%s stable=%s/%s agents=%d",
+		hit, r.Hits, r.PageIns, r.Evictions, r.Refusals, r.PageInBytes,
+		bytesText(uint64(max(r.ResidentBytes, 0))), bytesText(uint64(max(r.BudgetBytes, 0))),
+		bytesText(uint64(max(r.StableBytes, 0))), bytesText(uint64(max(r.StableCapBytes, 0))), st.Agents)
+}
+
+// reportServeExpertRingStats logs the shared ring's ledger whenever it moved since the last tick,
+// until the ring closes.
+func reportServeExpertRingStats(sh *fakmodel.SharedExpertRing, every time.Duration) {
+	last := -1
+	for {
+		time.Sleep(every)
+		st := sh.Stats()
+		if !st.Enabled {
+			return
+		}
+		if st.Ring.Lookups == last {
+			continue
+		}
+		last = st.Ring.Lookups
+		fmt.Fprintln(os.Stderr, "fak serve:", serveExpertRingStatsText(st))
+	}
 }

@@ -10,11 +10,18 @@ import "C"
 import (
 	"fmt"
 	"math"
+	"os"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
 var _ Qwen35IndependentDecodeBatchBackend = (*cudaBackend)(nil)
+
+// batchDiagEnabled gates the per-step stage-timing diagnostic line
+// (fak_batch_step_diag) used by the q2kxl concurrency-collapse investigation.
+// Off by default; FAK_BATCH_DIAG=1 turns it on. Pure observation: no behavior change.
+var batchDiagEnabled = os.Getenv("FAK_BATCH_DIAG") == "1"
 
 // qwen35DecodeBatchKVChunk is the growable-KV reservation quantum, in positions.
 const qwen35DecodeBatchKVChunk = 256
@@ -36,8 +43,9 @@ func (c *cudaBackend) cudaQwen35LaneRowView(parent *cudaBuf, row, width int) Ten
 // device step. Every projection (GDN in/out, attention Q/K/V/O, SwiGLU, head) runs once over
 // the [lanes, width] activation panel, so each weight byte streams once per step instead of
 // once per lane. Conv/recurrent state, RoPE position, KV append, and attention stay per lane.
-// Failures before the first state or KV write are declines (Mutated=false) the model replays
-// serially; later failures poison every lane's state and report Mutated=true.
+// Pure validation failures are declines the model can replay serially. Paged
+// ownership preparation is already non-replayable, before the first state/KV write;
+// subsequent failures poison every lane's state and report Mutated=true.
 func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBatchRequest) (result Qwen35IndependentDecodeBatchResult, err error) {
 	if err := validateQwen35IndependentDecodeBatchContract(req); err != nil {
 		return result, err
@@ -45,10 +53,19 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 	if admitErr := c.faultLatch.Admit("qwen35-independent-decode-batch"); admitErr != nil {
 		return result, &Qwen35IndependentDecodeBatchError{Stage: "device-admission", Cause: admitErr}
 	}
+	lockStart := time.Now()
 	cudaMu.Lock()
 	defer cudaMu.Unlock()
+	diagLockWait := time.Since(lockStart)
+	if admitErr := c.faultLatch.Admit("qwen35-independent-decode-batch"); admitErr != nil {
+		return result, &Qwen35IndependentDecodeBatchError{Stage: "device-admission", Cause: admitErr}
+	}
+	diagStart := time.Now()
+	var diagPre, diagKV, diagEmb, diagGDN, diagAttn, diagFFN, diagHead, diagFence time.Duration
 	lanes := len(req.Lanes)
 	first := req.Lanes[0]
+	_, pagedBatch := first.KV.(*cudaPagedKV)
+	paged := make([]*cudaQwen35PagedSequence, lanes)
 	stage, mutated, completed := "preflight", false, false
 	transientStart := len(c.transient)
 	fail := func(cause error) error {
@@ -68,6 +85,16 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 			err = fail(cause)
 		}
 		if !completed {
+			// Preparation can replace shared owners before numerical state advances.
+			// This defer also runs on Goexit, which recover does not observe.
+			for _, operation := range paged {
+				operation.abortLocked()
+			}
+			if mutated {
+				for _, lane := range req.Lanes {
+					c.qwen35SequencePoisonStates(lane)
+				}
+			}
 			c.qwen35SequenceReleaseSinceLocked(transientStart)
 		}
 	}()
@@ -81,7 +108,14 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 		if lane.TokenEmbeddingRows != first.TokenEmbeddingRows || (!lane.TokenEmbeddingRows && lane.TokenEmbedding.Buf() != first.TokenEmbedding.Buf()) {
 			return result, fail(fmt.Errorf("lane %d embedding source differs from lane 0", i))
 		}
-		kv, verr := c.validateQwen35SequenceRequestLocked(lane)
+		owner, isPaged := lane.KV.(*cudaPagedKV)
+		if isPaged != pagedBatch {
+			return result, fail(fmt.Errorf("lane %d mixes contiguous and paged KV owners", i))
+		}
+		if pagedBatch {
+			paged[i] = &cudaQwen35PagedSequence{c: c, k: owner}
+		}
+		kv, verr := c.validateQwen35SequenceStoreRequestLocked(lane, paged[i])
 		if verr != nil {
 			return result, fail(verr)
 		}
@@ -102,9 +136,22 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 	if err := c.validateQ56KOperation(first, lanes, lanes); err != nil {
 		return result, fail(err)
 	}
+	diagPre = time.Since(diagStart)
 	compactLayers := len(first.Layers) / 4
 	stage = "kv-reserve"
+	diagMark := time.Now()
+	var pagedControlH2D uint64
+	controlStart := uint64(C.fcuda_h2dxfer_bytes())
 	for i, lane := range req.Lanes {
+		if pagedBatch {
+			// All lanes were checked before effects. Each preparation sees the
+			// inventory published by the preceding lane under the same cudaMu.
+			mutated = true
+			if rerr := paged[i].prepareLocked(); rerr != nil {
+				return result, fail(rerr)
+			}
+			continue
+		}
 		// A growable store reserves in 256-position chunks: an exact +1 reservation would
 		// reallocate and copy every attention layer's KV on every step, and the allocator churn
 		// of those ever-growing sizes filled a 24 GB card within ~150 steps (Raider, Q4_K_M).
@@ -117,10 +164,33 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 			return result, fail(rerr)
 		}
 	}
+	if pagedBatch {
+		controlEnd := uint64(C.fcuda_h2dxfer_bytes())
+		if controlEnd < controlStart {
+			return result, fail(fmt.Errorf("paged control H2D counter regressed"))
+		}
+		pagedControlH2D = controlEnd - controlStart
+		// A later clone can grow and retire the common arenas. Earlier staged
+		// operations must use the final pool, never their cached retired bases.
+		for _, operation := range paged {
+			pool := operation.k.pool
+			operation.planes = [3][]unsafe.Pointer{pool.Kraw, pool.K, pool.V}
+			operation.capacity = pool.capBlocks
+		}
+	}
+	diagKV = time.Since(diagMark)
 
 	hidden, eps := first.Hidden, first.RMSNormEpsilon
 	h2dStart, d2hStart := uint64(C.fcuda_h2dxfer_bytes()), uint64(C.fcuda_hostxfer_bytes())
+	if pagedBatch {
+		// Embedding and GDN submit work before the first attention append. Until
+		// the final group fence, any unwind must close native transient cleanup.
+		for _, operation := range paged {
+			operation.executing, operation.drained = true, false
+		}
+	}
 	stage = "embedding"
+	diagMark = time.Now()
 	var x Tensor
 	var xBuf *cudaBuf
 	if first.TokenEmbeddingRows {
@@ -141,6 +211,7 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 			return result, fail(err)
 		}
 	}
+	diagEmb = time.Since(diagMark)
 	h2dAfterGather, d2hAfterGather := uint64(C.fcuda_h2dxfer_bytes()), uint64(C.fcuda_hostxfer_bytes())
 
 	panels, macs := 0, int64(0)
@@ -154,6 +225,7 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 	compact := 0
 	for index, layer := range first.Layers {
 		stage = fmt.Sprintf("layer-%d", index)
+		layerMark := time.Now()
 		normed, normBuf, nerr := c.qwen35SequenceRMSNormLocked(x, layer.InputNorm, lanes, eps, "batch-input-norm")
 		if nerr != nil {
 			return result, fail(nerr)
@@ -180,6 +252,7 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 				C.fcuda_add_f32(c.cf(x), c.cf(branch), C.int(lanes*hidden))
 			}
 			c.releaseTransientBuffers([]*cudaBuf{normBuf, branchBuf})
+			diagGDN += time.Since(layerMark)
 		} else {
 			qg, qgBuf, perr := project(layer.Q, normed, "batch-attention-qg")
 			if perr != nil {
@@ -223,11 +296,21 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 				if ropeErr != nil {
 					return result, fail(ropeErr)
 				}
-				if appendErr := c.qwen35SequenceAppendKVLocked(kvs[i], compact, kRow, kRoPE, vRow, lane.StartPos, 1); appendErr != nil {
-					return result, fail(appendErr)
-				}
-				if attnErr := c.qwen35BatchAttentionIntoLocked(qRoPE, kvs[i], compact, lane.StartPos, first.NumHeads, scale, c.cudaQwen35LaneRowView(attnBuf, i, qWidth)); attnErr != nil {
-					return result, fail(attnErr)
+				output := c.cudaQwen35LaneRowView(attnBuf, i, qWidth)
+				if pagedBatch {
+					if appendErr := paged[i].appendLocked(compact, kRow, kRoPE, vRow); appendErr != nil {
+						return result, fail(appendErr)
+					}
+					if _, _, attnErr := paged[i].attentionIntoLocked(qRoPE, compact, first.NumHeads, scale, output); attnErr != nil {
+						return result, fail(attnErr)
+					}
+				} else {
+					if appendErr := c.qwen35SequenceAppendKVLocked(kvs[i], compact, kRow, kRoPE, vRow, lane.StartPos, 1); appendErr != nil {
+						return result, fail(appendErr)
+					}
+					if attnErr := c.qwen35BatchAttentionIntoLocked(qRoPE, kvs[i], compact, lane.StartPos, first.NumHeads, scale, output); attnErr != nil {
+						return result, fail(attnErr)
+					}
 				}
 				c.releaseTransientBuffers([]*cudaBuf{qRoPEBuf, kRoPEBuf})
 			}
@@ -245,7 +328,9 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 			}
 			c.releaseTransientBuffers([]*cudaBuf{normBuf, qBuf, kRawBuf, valueBuf, gateBuf, attnBuf, projectedBuf})
 			compact++
+			diagAttn += time.Since(layerMark)
 		}
+		ffnMark := time.Now()
 		if !fused {
 			var perr error
 			postNorm, postNormBuf, perr = c.qwen35SequenceRMSNormLocked(x, layer.PostNorm, lanes, eps, "batch-post-attention-norm")
@@ -272,8 +357,10 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 		}
 		C.fcuda_add_f32(c.cf(x), c.cf(delta), C.int(lanes*hidden))
 		c.releaseTransientBuffers([]*cudaBuf{postNormBuf, gateBuf, upBuf, activatedBuf, deltaBuf})
+		diagFFN += time.Since(ffnMark)
 	}
 	stage = "output-head"
+	headMark := time.Now()
 	finalPanel, finalPanelBuf, ferr := c.qwen35SequenceRMSNormLocked(x, first.OutputNorm, lanes, eps, "batch-output-norm")
 	if ferr != nil {
 		return result, fail(ferr)
@@ -284,24 +371,55 @@ func (c *cudaBackend) Qwen35IndependentDecodeBatch(req Qwen35IndependentDecodeBa
 	}
 	logits.Shape = []int{lanes, first.Output.Shape[0]}
 	c.releaseTransientBuffers([]*cudaBuf{xBuf, finalPanelBuf})
+	diagHead = time.Since(headMark)
 	stage = "final-fence"
+	fenceMark := time.Now()
 	if serr := c.qwen35SequenceSyncLocked(); serr != nil {
 		atomic.StoreUint32(&logitsBuf.invalid, 1)
 		c.faultLatch.ObserveError(serr, "qwen35-independent-decode-batch-final-fence")
 		return result, fail(serr)
+	}
+	diagFence = time.Since(fenceMark)
+	if pagedBatch {
+		for _, operation := range paged {
+			operation.drained, operation.executing = true, false
+		}
 	}
 	h2dEnd, d2hEnd := uint64(C.fcuda_h2dxfer_bytes()), uint64(C.fcuda_hostxfer_bytes())
 	transfers := Qwen35SequenceTransferCounters{
 		H2DBytes: h2dEnd - h2dStart, D2HBytes: d2hEnd - d2hStart,
 		ActivationH2DBytes: h2dEnd - h2dAfterGather, ActivationD2HBytes: d2hEnd - d2hAfterGather,
 	}
+	if pagedControlH2D > ^uint64(0)-transfers.H2DBytes {
+		return result, fail(fmt.Errorf("paged control H2D total overflows"))
+	}
+	transfers.H2DBytes += pagedControlH2D
 	if transfers.ActivationH2DBytes != 0 || transfers.ActivationD2HBytes != 0 {
 		stage = "transfer-witness"
 		return result, fail(fmt.Errorf("activation traffic H2D=%d D2H=%d", transfers.ActivationH2DBytes, transfers.ActivationD2HBytes))
 	}
+	if pagedBatch {
+		// Every fallible boundary precedes publication for every lane. A late
+		// failure retains the entire group with all logical frontiers unchanged.
+		c.qwen35SequenceReleaseSinceLocked(transientStart, logitsBuf)
+		for _, operation := range paged {
+			if completeErr := operation.retireLocked(); completeErr != nil {
+				return result, fail(completeErr)
+			}
+		}
+		for _, operation := range paged {
+			operation.publishLocked()
+		}
+	}
 	result = Qwen35IndependentDecodeBatchResult{Logits: logits, Lanes: lanes, SharedProjectionPanels: panels, ProjectionMACs: macs, Transfers: transfers}
-	c.qwen35SequenceReleaseSinceLocked(transientStart, logitsBuf)
+	if !pagedBatch {
+		c.qwen35SequenceReleaseSinceLocked(transientStart, logitsBuf)
+	}
 	completed = true
+	if batchDiagEnabled {
+		fmt.Fprintf(os.Stderr, "fak_batch_step_diag lanes=%d pre_us=%d kv_us=%d emb_us=%d gdn_us=%d attn_us=%d ffn_us=%d head_us=%d fence_us=%d total_us=%d lockwait_us=%d h2d=%d d2h=%d\n",
+			lanes, diagPre.Microseconds(), diagKV.Microseconds(), diagEmb.Microseconds(), diagGDN.Microseconds(), diagAttn.Microseconds(), diagFFN.Microseconds(), diagHead.Microseconds(), diagFence.Microseconds(), time.Since(diagStart).Microseconds(), diagLockWait.Microseconds(), transfers.H2DBytes, transfers.D2HBytes)
+	}
 	return result, nil
 }
 

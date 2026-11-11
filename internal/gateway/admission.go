@@ -67,6 +67,7 @@ import (
 	"github.com/anthony-chaudhary/fak/internal/enginestep"
 	"github.com/anthony-chaudhary/fak/internal/kvbudget"
 	"github.com/anthony-chaudhary/fak/internal/session"
+	"github.com/anthony-chaudhary/fak/pkg/deadlineadmit"
 )
 
 // DefaultPreallocCeiling is the per-request ceiling on generation tokens preallocated
@@ -75,9 +76,34 @@ import (
 // admission, top-up re-admitting in chunks via Grow as it generates.
 const DefaultPreallocCeiling = 2048
 
+// AdmissionMode selects the primary waiting-queue ordering. The zero value keeps
+// the existing priority/aging or separately configured weighted-fair policy.
+type AdmissionMode uint8
+
+const (
+	AdmissionModePriority AdmissionMode = iota
+	// AdmissionModeEDF serves the earliest effective deadline first. It takes
+	// precedence over weighted-fair ordering; equal or absent deadlines retain
+	// priority/aging and deterministic FIFO tie-breaking. Deadline-free requests
+	// follow deadline-bearing work, so EDF does not promise them bounded waiting.
+	AdmissionModeEDF
+	// AdmissionModeSLO serves the waiter closest to violating its own SLO
+	// first: each SLO-bearing waiter is ranked by its expected SLO-violation
+	// margin (deadlineadmit.SloRank over waited time, predicted service time,
+	// and SLO target), and the largest margin is promoted first. Waiters
+	// without an SLO target are excluded from the ranking and served in
+	// arrival order behind every ranked waiter (the aibrix SLOQueue's
+	// no-SLO-info FIFO fallback). Equal margins fall back to arrival order
+	// then TraceID. Adapted from vllm-project/aibrix
+	// pkg/plugins/gateway/queue/slo_queue.go @ a89b94a574b2.
+	AdmissionModeSLO
+)
+
 // AdmissionPolicy holds the admission knobs. Each cap is disabled by a non-positive value
 // (so a test can isolate a single axis); DefaultAdmissionPolicy fills shipping defaults.
 type AdmissionPolicy struct {
+	// Mode is opt-in. Unrecognized values preserve the default ordering.
+	Mode AdmissionMode
 	// MaxNumSeqs caps the running set (vLLM's max-num-seqs): no request is admitted while
 	// the running count is at this bound. ≤0 disables the seq cap.
 	MaxNumSeqs int
@@ -174,9 +200,31 @@ type SeqRequest struct {
 	Trust     AdmissionTrust
 	CreatedAt time.Time
 	DecodeTTL time.Duration
+	// Deadline is an optional absolute admission-ordering target. The earlier of
+	// Deadline and CreatedAt+DecodeTTL is used when both are present. It does not
+	// replace context cancellation or change DecodeTTL expiration semantics.
+	Deadline time.Time
 	// PromptTokens is the prefill share of Tokens, charged against PrefillTokenBudget.
 	// ≤0 charges all of Tokens.
 	PromptTokens int
+}
+
+// DefaultTenantTokenBucket is the sliding-window bucket granularity a
+// TenantTokenWindow normalizes to when it leaves Bucket unset.
+const DefaultTenantTokenBucket = time.Minute
+
+// TenantTokenWindow is the borrowed VTC per-tenant token-fairness tracker config
+// (vllm-project/aibrix pkg/plugins/gateway/algorithms/vtc/token_tracker.go @
+// a89b94a574b2, Apache-2.0, ADAPT): a sliding window over per-tenant weighted
+// token charges, so a placement consumer can weight tenants by the tokens they
+// owe. Window ≤ 0 disables the tracker; Bucket ≤ 0 normalizes to
+// DefaultTenantTokenBucket; non-positive weights fall back to the vtc-basic
+// defaults (input 1, output 2).
+type TenantTokenWindow struct {
+	Window       time.Duration
+	Bucket       time.Duration
+	InputWeight  int
+	OutputWeight int
 }
 
 // baseTraceID strips any "#..." suffix from traceID and trims space.
@@ -389,7 +437,19 @@ type AdmissionController struct {
 	scheduler    *session.Scheduler
 	pool         *session.Pool
 	orderPolicy  session.Policy
-	credits      map[string]int64
+	// sloEstimate predicts a waiting request's service time from its token
+	// footprint for AdmissionModeSLO ranking. Nil (the default) means the gate
+	// holds no rate basis: SLO mode then orders by deadline proximity alone
+	// instead of fabricating an expectation. Guarded by mu like every other
+	// controller field.
+	sloEstimate func(tokens int) time.Duration
+	credits     map[string]int64
+	// tenantWindow is the normalized VTC per-tenant token-fairness window (zero
+	// Window = disabled); tenantTokens maps tenant → window-bucket start → charged
+	// weighted tokens. Both are guarded by mu like every other controller field;
+	// neither affects admission capacity.
+	tenantWindow TenantTokenWindow
+	tenantTokens map[string]map[time.Time]int
 	// decisions retains the most recent admission decision per trace id (bounded ring of
 	// admissionDecisionHistory entries), guarded by mu like every other controller field.
 	decisions     map[string]AdmissionDecisionReceipt
@@ -862,6 +922,20 @@ func (c *AdmissionController) Order() session.Policy {
 	return c.orderPolicy
 }
 
+// SetSLOEstimate attaches or replaces the service-time predictor that
+// AdmissionModeSLO ranks waiters with: it maps a request's token footprint to
+// its predicted service time. Pass nil to clear it; SLO mode then orders by
+// deadline proximity alone (waited time against the target), never fabricating
+// an expectation. Safe for concurrent use.
+func (c *AdmissionController) SetSLOEstimate(est func(tokens int) time.Duration) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sloEstimate = est
+}
+
 // AdmissionLease is the live request's hold on one admitted scheduler slot, plus (when a
 // token-rate gate is wired, #2019) its reservation against the provider token window.
 // Release is idempotent and schedules the next waiting request after freeing this
@@ -962,6 +1036,148 @@ func (c *AdmissionController) nowLocked() time.Time {
 		return c.clock()
 	}
 	return time.Now()
+}
+
+// SetTenantTokenWindow installs the borrowed VTC per-tenant token-fairness
+// tracker (vllm-project/aibrix pkg/plugins/gateway/algorithms/vtc/
+// token_tracker.go @ a89b94a574b2, Apache-2.0, ADAPT): when its Window is
+// positive the gate charges each tenant's admission-time estimate into a
+// sliding window of buckets; a zero/negative Window disables it and clears all
+// tracked usage. Unset Bucket and non-positive weights normalize to the
+// vtc-basic defaults (DefaultTenantTokenBucket, 1/2).
+func (c *AdmissionController) SetTenantTokenWindow(w TenantTokenWindow) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w.Window <= 0 {
+		c.tenantWindow = TenantTokenWindow{}
+		c.tenantTokens = nil
+		return
+	}
+	if w.Bucket <= 0 {
+		w.Bucket = DefaultTenantTokenBucket
+	}
+	if w.InputWeight <= 0 {
+		w.InputWeight = 1
+	}
+	if w.OutputWeight <= 0 {
+		w.OutputWeight = 2
+	}
+	c.tenantWindow = w
+}
+
+// TenantTokenWindow returns the installed (normalized) tracker config; the zero
+// value when the tracker is disabled.
+func (c *AdmissionController) TenantTokenWindow() TenantTokenWindow {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tenantWindow
+}
+
+// TenantTokens reports the tenant's live weighted-token total across its
+// unexpired window buckets. It returns ok=false when the tracker is disabled or
+// the tenant has no live charge — queued requests charge nothing until
+// promoted, so a waiter never shows a total here.
+func (c *AdmissionController) TenantTokens(tenant string) (int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tenantWindow.Window <= 0 {
+		return 0, false
+	}
+	c.pruneTenantWindowsLocked(c.nowLocked())
+	buckets := c.tenantTokens[tenant]
+	total := 0
+	for _, v := range buckets {
+		total += v
+	}
+	return total, len(buckets) > 0
+}
+
+// TenantTokenExtrema reports the smallest and largest live per-tenant totals
+// plus whether any tenant is tracked — the cross-tenant spread a placement
+// consumer weights by owed tokens. It returns (0,0,false) when the tracker is
+// disabled or no tenant carries a live charge.
+func (c *AdmissionController) TenantTokenExtrema() (min, max int, active bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tenantWindow.Window <= 0 {
+		return 0, 0, false
+	}
+	c.pruneTenantWindowsLocked(c.nowLocked())
+	for _, buckets := range c.tenantTokens {
+		total := 0
+		for _, v := range buckets {
+			total += v
+		}
+		if !active {
+			min, max, active = total, total, true
+		} else if total < min || total > max {
+			if total < min {
+				min = total
+			} else {
+				max = total
+			}
+		}
+	}
+	return min, max, active
+}
+
+// chargeTenantTokensLocked records one request's admission-time estimate in its
+// tenant's current window bucket: the prompt share at InputWeight plus the
+// planned-decode share at OutputWeight, with a negative decode share clamped to
+// zero instead of refunding the prompt. A disabled window tracks nothing.
+// Caller holds c.mu.
+func (c *AdmissionController) chargeTenantTokensLocked(req SeqRequest) {
+	w := c.tenantWindow
+	if w.Window <= 0 {
+		return
+	}
+	prompt := req.promptTokens()
+	decode := req.Tokens - prompt
+	if decode < 0 {
+		decode = 0
+	}
+	charge := prompt*w.InputWeight + decode*w.OutputWeight
+	if charge <= 0 {
+		return
+	}
+	tenant := req.SessionID
+	if tenant == "" {
+		tenant = baseTraceID(req.TraceID)
+	}
+	now := c.nowLocked()
+	if c.tenantTokens == nil {
+		c.tenantTokens = make(map[string]map[time.Time]int)
+	}
+	buckets := c.tenantTokens[tenant]
+	if buckets == nil {
+		buckets = make(map[time.Time]int)
+		c.tenantTokens[tenant] = buckets
+	}
+	for b := range buckets {
+		if now.Sub(b) >= w.Window {
+			delete(buckets, b)
+		}
+	}
+	buckets[now.Truncate(w.Bucket)] += charge
+}
+
+// pruneTenantWindowsLocked drops every bucket that has slid out of the window
+// and removes tenants left with none. Caller holds c.mu.
+func (c *AdmissionController) pruneTenantWindowsLocked(now time.Time) {
+	w := c.tenantWindow
+	if w.Window <= 0 || len(c.tenantTokens) == 0 {
+		return
+	}
+	for tenant, buckets := range c.tenantTokens {
+		for b := range buckets {
+			if now.Sub(b) >= w.Window {
+				delete(buckets, b)
+			}
+		}
+		if len(buckets) == 0 {
+			delete(c.tenantTokens, tenant)
+		}
+	}
 }
 
 // Offer presents a new request to the gate and classifies it. It admits straight to the
@@ -1146,13 +1362,15 @@ func (c *AdmissionController) admissionTraceID(traceID string) string {
 }
 
 // Schedule runs ONE admission round: it advances the aging clock, orders the waiting queue
-// by effective priority, and promotes waiters into the running set while the token budget
-// and the max-num-seqs cap have headroom — stopping at the first request that does not fit
-// so a lower-priority request can never jump ahead of a blocked higher-priority one
+// by the configured priority, EDF, or SLO policy, and promotes waiters while the token
+// budget and the max-num-seqs cap have headroom — stopping at the first request that does
+// not fit so a lower-ranked request cannot bypass the selected queue head
 // (head-of-line discipline). It returns the requests admitted this round, in admission
 // order. The native loop calls it each iteration; a host with a freed slot calls it after
-// Complete. Because the clock advances every call, a request passed over this round ages
-// toward the head — the starvation guard.
+// Complete. Each call advances priority aging; in EDF mode that aging resolves
+// equal deadlines and cannot overtake an earlier deadline; in SLO mode the
+// violation-margin order stands on its own (equal margins fall back to arrival
+// order then TraceID).
 func (c *AdmissionController) Schedule() []SeqRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1186,9 +1404,21 @@ func (c *AdmissionController) scheduleLocked() []SeqRequest {
 		return nil
 	}
 
-	isWeightedFair := c.orderPolicy == session.WeightedFair || (c.scheduler != nil && c.scheduler.Policy() == session.WeightedFair)
+	isEDF := c.policy.Mode == AdmissionModeEDF
+	isSLO := c.policy.Mode == AdmissionModeSLO
+	isWeightedFair := !isEDF && !isSLO && (c.orderPolicy == session.WeightedFair || (c.scheduler != nil && c.scheduler.Policy() == session.WeightedFair))
 	if !isWeightedFair {
 		sort.SliceStable(c.waiting, func(i, j int) bool {
+			if isSLO {
+				if before, decided := c.sloOrderLocked(c.waiting[i], c.waiting[j]); decided {
+					return before
+				}
+			}
+			if isEDF {
+				if before, decided := deadlineOrder(c.waiting[i].req, c.waiting[j].req); decided {
+					return before
+				}
+			}
 			ei, ej := c.effectivePriorityLocked(c.waiting[i]), c.effectivePriorityLocked(c.waiting[j])
 			if ei != ej {
 				return ei < ej // lower effective priority value served first
@@ -1622,9 +1852,9 @@ func (c *AdmissionController) prefillFitsLocked(tickPrompt int, req SeqRequest) 
 	return budget <= 0 || tickPrompt == 0 || tickPrompt+req.promptTokens() <= budget
 }
 
-// deadlineOrder is the EDF tiebreak within equal effective priority, adapted from
-// microsoft/vidur EDF request queue ordering: the earlier deadline (CreatedAt+DecodeTTL)
-// is served first and a request with no deadline sorts after every one that has one.
+// deadlineOrder is the primary EDF order or the default policy's equal-priority
+// tiebreak, adapted from microsoft/vidur EDF request queue ordering. The earlier
+// effective deadline is served first; requests without deadlines sort last.
 // decided is false when neither carries a deadline or both deadlines are equal, so the
 // FIFO tiebreak stands.
 func deadlineOrder(a, b SeqRequest) (before, decided bool) {
@@ -1643,10 +1873,60 @@ func deadlineOrder(a, b SeqRequest) (before, decided bool) {
 }
 
 func requestDeadline(r SeqRequest) (time.Time, bool) {
-	if r.DecodeTTL <= 0 || r.CreatedAt.IsZero() {
-		return time.Time{}, false
+	deadline := r.Deadline
+	if r.DecodeTTL > 0 && !r.CreatedAt.IsZero() {
+		ttl := r.CreatedAt.Add(r.DecodeTTL)
+		if deadline.IsZero() || ttl.Before(deadline) {
+			deadline = ttl
+		}
 	}
-	return r.CreatedAt.Add(r.DecodeTTL), true
+	return deadline, !deadline.IsZero()
+}
+
+// sloOrderLocked is the SLO-mode order (AdmissionModeSLO), adapted from
+// vllm-project/aibrix pkg/plugins/gateway/queue/slo_queue.go @ a89b94a574b2
+// (its SLO comparator plus the no-SLO-info FIFO fallback): the waiter whose
+// expected SLO-violation margin is largest — closest to missing its own SLO —
+// is served first, and waiters without an SLO target are excluded from the
+// ranking and fall back to arrival order behind every ranked waiter. The
+// margin is deadlineadmit.SloRank over the waited time, the predicted service
+// time (c.sloEstimate when wired; zero when it is not, so the gate never
+// fabricates an expectation), and the SLO target measured from CreatedAt via
+// the shared requestDeadline seam. A waiter past its target carries the
+// largest possible urgency. Equal margins fall back to arrival order then
+// TraceID, so the order is total and a pure function of the queued set
+// (decided is always true). Caller holds c.mu.
+func (c *AdmissionController) sloOrderLocked(a, b waitEntry) (before, decided bool) {
+	da, okA := requestDeadline(a.req)
+	db, okB := requestDeadline(b.req)
+	switch {
+	case okA != okB:
+		// Ranked waiters precede the FIFO fallback set.
+		return okA, true
+	case !okA:
+		// Neither carries an SLO target: the no-SLO-info FIFO fallback serves
+		// them in arrival order, then TraceID.
+		if a.enqueuedRound != b.enqueuedRound {
+			return a.enqueuedRound < b.enqueuedRound, true
+		}
+		return a.req.TraceID < b.req.TraceID, true
+	}
+	now := c.nowLocked()
+	margin := func(req SeqRequest, d time.Time) float64 {
+		expected := time.Duration(0)
+		if c.sloEstimate != nil {
+			expected = c.sloEstimate(req.Tokens)
+		}
+		return deadlineadmit.SloRank(now.Sub(req.CreatedAt), expected, d.Sub(req.CreatedAt))
+	}
+	ma, mb := margin(a.req, da), margin(b.req, db)
+	if ma != mb {
+		return ma > mb, true // larger margin: closer to violating its own SLO
+	}
+	if a.enqueuedRound != b.enqueuedRound {
+		return a.enqueuedRound < b.enqueuedRound, true
+	}
+	return a.req.TraceID < b.req.TraceID, true
 }
 
 // effectivePriorityLocked is a waiting request's priority adjusted for how long it has

@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/anthony-chaudhary/fak/internal/abi"
@@ -18,6 +20,61 @@ import (
 	"github.com/anthony-chaudhary/fak/internal/tokenizer"
 	"github.com/anthony-chaudhary/fak/internal/toolplugin"
 )
+
+// WorkspaceAdmissionMode selects what the gateway's own lease-admission floor
+// does with a refused write after the kernel allowed the call.
+//
+//   - "open" (going-forward default): the gateway's own floor is admit-and-log —
+//     DEFAULT_DENY-class refusals AND peer LEASE_HELD conflicts are admitted
+//     with would_deny forensic records (By "lease-admission-open"); kernel
+//     policy denials are structurally untouched (lease admission only runs
+//     after a kernel ALLOW/TRANSFORM).
+//   - "permissive": the legacy opt-in — DEFAULT_DENY-class refusals admitted;
+//     peer LEASE_HELD conflicts remain enforced.
+//   - "strict": the legacy shipped default — every lease-admission refusal stands.
+type WorkspaceAdmissionMode string
+
+const (
+	WorkspaceAdmissionOpen       WorkspaceAdmissionMode = "open"
+	WorkspaceAdmissionPermissive WorkspaceAdmissionMode = "permissive"
+	WorkspaceAdmissionStrict     WorkspaceAdmissionMode = "strict"
+)
+
+// DefaultWorkspaceAdmissionMode is the shipped going-forward default.
+const DefaultWorkspaceAdmissionMode = WorkspaceAdmissionOpen
+
+// ParseWorkspaceAdmissionMode accepts the three mode tokens (trim + lowercase).
+// An empty value is NOT an error: it returns "" so callers can resolve it
+// through ResolveWorkspaceAdmissionMode. An unknown token fails loud with the
+// valid set.
+func ParseWorkspaceAdmissionMode(v string) (WorkspaceAdmissionMode, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return "", nil
+	case string(WorkspaceAdmissionOpen):
+		return WorkspaceAdmissionOpen, nil
+	case string(WorkspaceAdmissionPermissive):
+		return WorkspaceAdmissionPermissive, nil
+	case string(WorkspaceAdmissionStrict):
+		return WorkspaceAdmissionStrict, nil
+	default:
+		return "", fmt.Errorf("invalid workspace admission mode %q: want open|permissive|strict", v)
+	}
+}
+
+// ResolveWorkspaceAdmissionMode folds the explicit mode and the legacy permissive
+// bool into the single resolved posture: an explicit cfg.WorkspaceAdmission wins
+// (New validates it parses); else the permissive bool true resolves to
+// permissive; else the going-forward open default.
+func ResolveWorkspaceAdmissionMode(cfg Config) WorkspaceAdmissionMode {
+	if mode, err := ParseWorkspaceAdmissionMode(cfg.WorkspaceAdmission); err == nil && mode != "" {
+		return mode
+	}
+	if cfg.WorkspaceAdmissionPermissive {
+		return WorkspaceAdmissionPermissive
+	}
+	return DefaultWorkspaceAdmissionMode
+}
 
 // DefaultCompactHistoryBudget is the resident-token line the cache-prefix-preserving
 // history compaction trims the kept window to BY DEFAULT on the Anthropic passthrough.
@@ -247,9 +304,61 @@ type Config struct {
 	// Adjudicators optionally supplies a complete per-server kernel chain. A nil
 	// chain preserves the registered pipeline; callers must retain every floor.
 	Adjudicators []abi.Adjudicator
-	// WorkspaceAdmissionPermissive explicitly admits lease DEFAULT_DENY failures.
-	// Peer LEASE_HELD conflicts and kernel policy denials remain enforced.
+	// WorkspaceAdmission explicitly selects the gateway's own lease-admission mode
+	// (open|permissive|strict). Empty defers to the legacy permissive bool below,
+	// then to the open default; a non-empty value that does not parse fails New loud.
+	WorkspaceAdmission string
+	// WorkspaceAdmissionPermissive is the legacy compat lever superseded by
+	// WorkspaceAdmission: when no explicit mode is set, true resolves the mode to
+	// permissive. It no longer drives admission on its own.
 	WorkspaceAdmissionPermissive bool
+	// ToolGuard selects the gateway's tool-plane interception posture ("on" or
+	// "off"; empty resolves ON). OFF is raw pass-through: proposed tool calls
+	// reach the client unadjudicated and inbound tool results reach the model
+	// byte-identical, with zero interception processing on the hot path. ON (the
+	// library default, and the harness products) arms the historical floor:
+	// tool-call adjudication + the kernel result-admission chain (context-MMU
+	// quarantine, normgate secret/PII masking, IFC taint). `fak serve` resolves
+	// this from --guard / FAK_GUARD and defaults OFF (the raw router posture);
+	// `fak guard` pins it ON. An explicit unparsable value fails New loud.
+	ToolGuard string
+	// CtxPaging selects the OVERSIZE-PAGING posture for tool results on the
+	// chat/responses wires ("on" | "off" | "auto"; empty resolves AUTO). AUTO
+	// (the library default, and the harness products) pages an oversize-but-
+	// benign tool result to a {"_paged":true} restore stub whenever the client
+	// can restore one; OFF never pages — a tool result reaches the model whole,
+	// byte-identical, and no restore stub or restore affordance is created by
+	// paging. The per-request X-Fak-Ctx-Paging header and the FAK_CTX_PAGING
+	// process env still win over this posture (header > env > config). `fak
+	// serve` resolves this from --ctx-paging / FAK_CTX_PAGING and defaults OFF
+	// (the 2026-11-10 hosting-simplification flip: the serving router does not
+	// rewrite context by default); `fak guard` leaves it empty (AUTO). An
+	// explicit unparsable value fails New loud.
+	CtxPaging string
+	// ChatToolResultElide selects the chat/responses tool-result ELISION
+	// posture ("on" | "off"; empty resolves ON). ON (the library default, and
+	// the harness products) rewrites an old oversized tool result beyond the
+	// active working set into a "...[fak: tool output elided ... recover via
+	// fak_context_restore id=sha256:...]..." marker and auto-advertises the
+	// restore tool to clients that carry fak MCP tools. OFF never rewrites a
+	// tool result and never auto-advertises the restore tool — the client's
+	// declared tools pass through untouched (a restore tool already present in
+	// the history's markers stays advertised, so an earlier-armed session can
+	// still recover). `fak serve` resolves this from --chat-elide /
+	// FAK_CHAT_ELIDE and defaults OFF (the same hosting-simplification flip);
+	// `fak guard` leaves it empty (ON). An explicit unparsable value fails New
+	// loud.
+	ChatToolResultElide string
+	// SessionLane is the LAUNCH-TIME lane designation the host (fak guard) stamps
+	// onto every served tool call as trusted Meta["lane"] (#3707/#3708/#3709). It
+	// is the coordinator's spawn-time designation — the same trust level as the
+	// env the dispatcher sets for fleet workers — never wire input: the agent
+	// cannot set or spoof it. Lane-aware floors (test immunity) resolve the
+	// acting lane from it, so a designated test-author session launched with
+	// --lane test (or FAK_LANE=test) gets truthful lane semantics on the serving
+	// path instead of the historical "no lane attribution" default. Empty keeps
+	// the historical behavior byte-for-byte.
+	SessionLane string
 	// ControlIngress optionally supplies the operator control request handler.
 	// Nil leaves the control ingress disabled.
 	ControlIngress ControlIngress
@@ -770,6 +879,13 @@ type Config struct {
 	// shrinker for results outside the active working set. The command surfaces default this
 	// to DefaultElideResultBytes.
 	ElideResultBytes int
+	// ModelPassthrough forwards the client's requested model upstream on the Anthropic
+	// /v1/messages wire when the planner is a single proxy (the DualPlanner already
+	// forwards it). Off by default: that wire historically sent the configured Model for
+	// every request. Arm it when the upstream is itself a model router (the Claude Code
+	// front door) so a client-selected model reaches the router instead of being
+	// silently replaced by --model. An omitted client model still sends the configured Model.
+	ModelPassthrough bool
 	// ElideStaleReads arms the read-lifecycle STALE elision: a Read tool_result whose file was
 	// Edited/Written in a LATER in-session turn is replaced (in the same cache-safe working-set band
 	// as ElideResultBytes) by a restorable marker, the pre-edit snapshot stashed behind a

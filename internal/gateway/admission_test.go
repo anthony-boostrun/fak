@@ -873,3 +873,182 @@ func TestAdmissionSplitPrefillAndTotalBudget(t *testing.T) {
 		t.Fatalf("prefill budget disabled: second round admitted %v, want none", ids(second))
 	}
 }
+
+// fak-test:runtime fast est=2ms lane=default
+func TestAdmissionEDFMode(t *testing.T) {
+	at := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		mode     AdmissionMode
+		weighted bool
+		want     []string
+	}{
+		{"default", AdmissionModePriority, false, []string{"none", "late", "ttl", "early", "tie"}},
+		{"edf", AdmissionModeEDF, false, []string{"ttl", "early", "tie", "late", "none"}},
+		{"edf_over_weighted_fair", AdmissionModeEDF, true, []string{"ttl", "early", "tie", "late", "none"}},
+		{"unknown_mode", AdmissionMode(255), false, []string{"none", "late", "ttl", "early", "tie"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewAdmissionController(AdmissionPolicy{Mode: tc.mode, MaxNumSeqs: 1, TokenBudget: 4, MaxWaiting: 8})
+			c.SetClock(func() time.Time { return at })
+			if tc.weighted {
+				c.SetOrder(session.WeightedFair)
+			}
+			if v := c.Offer(SeqRequest{TraceID: "blocker", Tokens: 4}); v != VerdictAdmitted {
+				t.Fatal(v)
+			}
+			for _, req := range []SeqRequest{
+				{TraceID: "none", Priority: 0, Tokens: 2},
+				{TraceID: "late", Priority: 1, Tokens: 2, Deadline: at.Add(time.Minute)},
+				{TraceID: "tie", Priority: 4, Tokens: 2, Deadline: at.Add(10 * time.Second)},
+				{TraceID: "early", Priority: 3, Tokens: 2, Deadline: at.Add(10 * time.Second)},
+				{TraceID: "ttl", Priority: 2, Tokens: 2, Deadline: at.Add(30 * time.Second), CreatedAt: at, DecodeTTL: time.Second},
+			} {
+				if v := c.Offer(req); v != VerdictQueued {
+					t.Fatalf("%s = %s, want queued", req.TraceID, v)
+				}
+			}
+			running := "blocker"
+			for i, want := range tc.want {
+				if !c.Complete(running) {
+					t.Fatalf("Complete(%s) failed", running)
+				}
+				got := c.Schedule()
+				if len(got) != 1 || got[0].TraceID != want {
+					t.Fatalf("dequeue[%d] = %+v, want %s", i, got, want)
+				}
+				running = got[0].TraceID
+			}
+			c.Complete(running)
+			if st := c.Stats(); st.Running != 0 || st.Waiting != 0 || st.TokensInUse != 0 || st.QueuedTokens != 0 {
+				t.Fatalf("final accounting = %+v", st)
+			}
+		})
+	}
+}
+
+// fak-test:runtime fast est=1ms lane=default
+func TestAdmissionEDFPreservesBudgetHeadOfLine(t *testing.T) {
+	at := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	c := NewAdmissionController(AdmissionPolicy{Mode: AdmissionModeEDF, MaxNumSeqs: 3,
+		TokenBudget: 6, PrefillTokenBudget: 3, MaxWaiting: 8})
+	c.SetClock(func() time.Time { return at })
+	c.Offer(SeqRequest{TraceID: "blocker", Tokens: 4})
+	c.Offer(SeqRequest{TraceID: "urgent", Priority: 9, Tokens: 4, PromptTokens: 2, Deadline: at.Add(time.Second)})
+	c.Offer(SeqRequest{TraceID: "later", Priority: 1, Tokens: 2, PromptTokens: 2, Deadline: at.Add(time.Minute)})
+	if got := c.Schedule(); len(got) != 0 {
+		t.Fatalf("urgent over-budget head was bypassed: %+v", got)
+	}
+	c.Complete("blocker")
+	if got := c.Schedule(); len(got) != 1 || got[0].TraceID != "urgent" {
+		t.Fatalf("prefill round budget not preserved: %+v", got)
+	}
+	if got := c.Schedule(); len(got) != 1 || got[0].TraceID != "later" {
+		t.Fatalf("next round did not fill remaining token capacity: %+v", got)
+	}
+	if st := c.Stats(); st.Running != 2 || st.TokensInUse != 6 || st.Waiting != 0 || st.QueuedTokens != 0 {
+		t.Fatalf("budget accounting = %+v", st)
+	}
+	c.Complete("urgent")
+	c.Complete("later")
+}
+
+// TestAdmissionTenantTokenWindow pins the borrowed VTC per-tenant token-fairness
+// tracker (aibrix-3, vllm-project/aibrix pkg/plugins/gateway/algorithms/vtc/
+// token_tracker.go @ a89b94a574b2, Apache-2.0, ADAPT): the gate's per-tenant
+// verdict axis carries a sliding-window input/output token tracker that charges
+// each tenant's ADMISSION-TIME estimate (prompt share at InputWeight, planned
+// decode share at OutputWeight) when its request enters the running set, expires
+// buckets that slide out of the window, and reports per-tenant totals plus the
+// cross-tenant extrema a placement consumer weights by owed tokens.
+//
+// fak-test:runtime fast est=1ms lane=default
+func TestAdmissionTenantTokenWindow(t *testing.T) {
+	// Disabled by default: the surface is inert until installed (zero Window).
+	c0 := NewAdmissionController(DefaultAdmissionPolicy())
+	if w := c0.TenantTokenWindow(); w != (TenantTokenWindow{}) {
+		t.Fatalf("default tenant window = %+v, want zero/disabled", w)
+	}
+	if got, ok := c0.TenantTokens("t1"); ok || got != 0 {
+		t.Fatalf("disabled tracker: TenantTokens = %d (ok=%v), want none", got, ok)
+	}
+	if _, _, active := c0.TenantTokenExtrema(); active {
+		t.Fatal("disabled tracker reported active extrema")
+	}
+
+	clk := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	c := NewAdmissionController(AdmissionPolicy{MaxNumSeqs: 1, MaxWaiting: 16})
+	c.SetClock(func() time.Time { return clk })
+	c.SetTenantTokenWindow(TenantTokenWindow{Window: 10 * time.Minute, Bucket: 1 * time.Minute})
+
+	// t1 admitted on the fast path: prompt 40 @ weight 1 + decode 60 @ weight 2 = 160.
+	if v := c.Offer(SeqRequest{TraceID: "r1", SessionID: "t1", Tokens: 100, PromptTokens: 40}); v != VerdictAdmitted {
+		t.Fatalf("r1 verdict = %s, want admitted", v)
+	}
+	// t2 waits behind the saturated slot: queueing charges nothing.
+	if v := c.Offer(SeqRequest{TraceID: "r2", SessionID: "t2", Tokens: 50, PromptTokens: 50}); v != VerdictQueued {
+		t.Fatalf("r2 verdict = %s, want queued", v)
+	}
+	if got, ok := c.TenantTokens("t1"); !ok || got != 160 {
+		t.Fatalf("t1 window total = %d (ok=%v), want 160", got, ok)
+	}
+	if got, ok := c.TenantTokens("t2"); ok || got != 0 {
+		t.Fatalf("queued t2 window total = %d (ok=%v), want none", got, ok)
+	}
+	if mn, mx, active := c.TenantTokenExtrema(); !active || mn != 160 || mx != 160 {
+		t.Fatalf("extrema after one charge = (%d,%d,active=%v), want (160,160,true)", mn, mx, active)
+	}
+
+	// Promotion five minutes later charges the waiter's own estimate into a newer
+	// bucket: prompt 50 @ 1 + decode 0 @ 2 = 50.
+	clk = clk.Add(5 * time.Minute)
+	if !c.Complete("r1") {
+		t.Fatal("Complete(r1) reported not-running")
+	}
+	if got := c.Schedule(); len(got) != 1 || got[0].TraceID != "r2" {
+		t.Fatalf("Schedule admitted %v, want [r2]", got)
+	}
+	if got, ok := c.TenantTokens("t2"); !ok || got != 50 {
+		t.Fatalf("t2 window total after promotion = %d (ok=%v), want 50", got, ok)
+	}
+	if mn, mx, active := c.TenantTokenExtrema(); !active || mn != 50 || mx != 160 {
+		t.Fatalf("extrema after two charges = (%d,%d,active=%v), want (50,160,true)", mn, mx, active)
+	}
+	if _, ok := c.TenantTokens("unknown"); ok {
+		t.Fatal("unknown tenant reported a total")
+	}
+
+	// Sliding window: past the 10-minute bound the cutoff is 12:01 — t1's 12:00
+	// bucket lapses (its entry is dropped entirely) while t2's 12:05 bucket stays.
+	clk = clk.Add(6 * time.Minute) // 12:11
+	if got, ok := c.TenantTokens("t1"); ok || got != 0 {
+		t.Fatalf("t1 after expiry = %d (ok=%v), want none", got, ok)
+	}
+	if got, ok := c.TenantTokens("t2"); !ok || got != 50 {
+		t.Fatalf("t2 after expiry = %d (ok=%v), want 50", got, ok)
+	}
+	if mn, mx, active := c.TenantTokenExtrema(); !active || mn != 50 || mx != 50 {
+		t.Fatalf("extrema after expiry = (%d,%d,active=%v), want (50,50,true)", mn, mx, active)
+	}
+
+	// Non-positive weights fall back to the vtc-basic defaults (1/2), and a
+	// negative planned-decode share clamps to zero instead of refunding.
+	c2 := NewAdmissionController(DefaultAdmissionPolicy())
+	c2.SetClock(func() time.Time { return clk })
+	c2.SetTenantTokenWindow(TenantTokenWindow{Window: time.Hour})
+	if w := c2.TenantTokenWindow(); w.Bucket != DefaultTenantTokenBucket || w.InputWeight != 1 || w.OutputWeight != 2 {
+		t.Fatalf("normalized window = %+v, want bucket %s weights 1/2", w, DefaultTenantTokenBucket)
+	}
+	if v := c2.Offer(SeqRequest{TraceID: "x", SessionID: "t3", Tokens: 10, PromptTokens: 40}); v != VerdictAdmitted {
+		t.Fatalf("x verdict = %s, want admitted", v)
+	}
+	if got, ok := c2.TenantTokens("t3"); !ok || got != 40 {
+		t.Fatalf("t3 window total = %d (ok=%v), want 40 (40*1 + clamp(10-40)*2)", got, ok)
+	}
+
+	// Reinstalling with a disabled window clears tracked usage.
+	c2.SetTenantTokenWindow(TenantTokenWindow{})
+	if got, ok := c2.TenantTokens("t3"); ok || got != 0 {
+		t.Fatalf("after disable: t3 = %d (ok=%v), want none", got, ok)
+	}
+}

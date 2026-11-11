@@ -1,0 +1,329 @@
+{
+  "rows": [
+    {
+      "id": "expertcachelrfu",
+      "canonical": "ExpertCacheLRFU",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Bounded logical resident-slot replacement policy in modelloadplan adapted from llama.cpp ClassLRU (src/llama-moe-cache.cpp, MIT). Eight frequency-class LRU lists retain exponentially decayed CRF across eviction, and Plan chooses, among the oldest unselected candidate of each class, the one with the largest age divided by 2^class. Per-layer int64 token clocks advance per Plan call, methods serialize access through a mutex, and a returned slot is not evidence that weights are loaded.",
+      "distinction": "Host-side logical residency planning over simulated slots and token clocks, not physical weight placement (ExpertCacheTier), loader I/O, device synchronization, the live paged-ring victim ranking ExpertRingEvictLRU, or the ctxmmu two-ring ExpertResidencyPolicy that owns a real ResidencyBacking store. A returned slot does not prove resident physical weights.",
+      "distinct_from": [
+        "expert-tier-cache-tier",
+        "expertcachelrfumaxentries",
+        "errexpertcachelrfuconfig",
+        "expertcachekey",
+        "newexpertcachelrfu",
+        "expertcachelrfu-resident-slots",
+        "evict-expert-ring-lru",
+        "residency-expert-residency-policy",
+        "cov5304-expert-cache-plan"
+      ],
+      "aliases": [],
+      "grounding": "ExpertCacheLRFU",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfumaxentries",
+      "canonical": "ExpertCacheLRFUMaxEntries",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Public constant 1<<20 bounding the logical layer-times-expert entries accepted by NewExpertCacheLRFU; the constructor checks it using division before allocating arrays.",
+      "distinction": "Bounds policy metadata geometry (layer-times-expert entries), not the requested resident slot count, not byte capacity, and not the eight frequency-class count.",
+      "distinct_from": [
+        "expertcachelrfu",
+        "expertcachelrfuclasses",
+        "newexpertcachelrfu",
+        "errexpertcachelrfuconfig"
+      ],
+      "aliases": [],
+      "grounding": "ExpertCacheLRFUMaxEntries",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfuclasses",
+      "canonical": "expertCacheLRFUClasses",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Unexported constant 8 fixing the number of frequency buckets into which ExpertCacheLRFU organizes its resident slots, one LRU list per bucket with matching head/tail arrays.",
+      "distinction": "The bucket count organizing resident slots into per-class LRU lists - not the metadata entry capacity bound (ExpertCacheLRFUMaxEntries) and not physical weight-storage tiers; the sibling expertCacheLRFUClass function maps a CRF value into these buckets.",
+      "distinct_from": [
+        "expertcachelrfumaxentries",
+        "expertcachelrfuhalflife",
+        "expertcachelrfuclass",
+        "cachelrfu-class-fn"
+      ],
+      "aliases": [],
+      "grounding": "expertCacheLRFUClasses",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfuhalflife",
+      "canonical": "expertCacheLRFUHalfLife",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Unexported float32 constant 128 giving the per-layer token-clock half-life used by the decayed method: retained CRF is multiplied by Exp2(-age/halfLife), where age is measured in layer-clock tokens since last use.",
+      "distinction": "A token-age decay constant for CRF, not wall-clock duration, not the class count, and not an eviction deadline; the victim choice separately scores age divided by 2^class.",
+      "distinct_from": [
+        "expertcachelrfuclasses",
+        "expertcachelrfu",
+        "expertcachelrfuentry"
+      ],
+      "aliases": [],
+      "grounding": "expertCacheLRFUHalfLife",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "errexpertcachelrfuconfig",
+      "canonical": "ErrExpertCacheLRFUConfig",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Sentinel error refused by NewExpertCacheLRFU for nonpositive geometry, excessive logical entries, or resident slots exceeding layer-times-expert entries.",
+      "distinction": "Rejects policy construction geometry, unlike ErrExpertCacheLRFUInput which rejects an access to an existing policy; it is never returned by Plan or Inspect.",
+      "distinct_from": [
+        "expertcachelrfu",
+        "errexpertcachelrfuinput",
+        "errexpertcachelrfucapacity",
+        "newexpertcachelrfu"
+      ],
+      "aliases": [],
+      "grounding": "ErrExpertCacheLRFUConfig",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "errexpertcachelrfuinput",
+      "canonical": "ErrExpertCacheLRFUInput",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Sentinel error refused by Plan and Inspect for a nil receiver, an out-of-range layer or expert ID, a negative token increment, or a selected expert id outside the configured range.",
+      "distinction": "Malformed-access refusal, not valid selections exceeding resident slots (ErrExpertCacheLRFUCapacity) and not token-clock overflow (ErrExpertCacheLRFUClock); it also guards construction-free reads via Inspect.",
+      "distinct_from": [
+        "errexpertcachelrfuconfig",
+        "errexpertcachelrfucapacity",
+        "errexpertcachelrfuclock"
+      ],
+      "aliases": [],
+      "grounding": "ErrExpertCacheLRFUInput",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "errexpertcachelrfucapacity",
+      "canonical": "ErrExpertCacheLRFUCapacity",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Sentinel error refused by Plan when the distinct selected experts exceed the available logical resident slots, before any policy state changes.",
+      "distinction": "Selected-set cardinality overflow of the logical resident slots, not constructor metadata geometry (ErrExpertCacheLRFUConfig) and not a physical memory allocation failure.",
+      "distinct_from": [
+        "errexpertcachelrfuinput",
+        "errexpertcachelrfuclock",
+        "errexpertcachelrfuconfig",
+        "expertcachelrfu"
+      ],
+      "aliases": [],
+      "grounding": "ErrExpertCacheLRFUCapacity",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "errexpertcachelrfuclock",
+      "canonical": "ErrExpertCacheLRFUClock",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Sentinel error refused by Plan when a nonnegative token increment would overflow the selected layer's int64 token clock; policy state stays unchanged on refusal.",
+      "distinction": "Protects int64 token-clock arithmetic in Plan, not a timeout, wall-clock fault, or resident-capacity refusal; it fires only when the clock sum would overflow.",
+      "distinct_from": [
+        "errexpertcachelrfucapacity",
+        "errexpertcachelrfuinput",
+        "expertcachelrfuhalflife"
+      ],
+      "aliases": [],
+      "grounding": "ErrExpertCacheLRFUClock",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachekey",
+      "canonical": "ExpertCacheKey",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Layer and Expert integer pair identifying one logical expert in the ExpertCacheLRFU policy and its fill or eviction observations.",
+      "distinction": "This identifies an expert, not a resident slot, physical pointer, payload digest or access-frequency score; not ExpertCacheLRFUFill (the miss RESULT that carries a key) and not ExpertCacheLRFU (the policy owning the key space).",
+      "distinct_from": [
+        "expertcachelrfu",
+        "expertcachelrfufill"
+      ],
+      "aliases": [],
+      "grounding": "ExpertCacheKey",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfufill",
+      "canonical": "ExpertCacheLRFUFill",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "One logical cache-plan miss result: the selected ExpertCacheKey, the assigned resident slot, and an optional owned copy of the evicted expert key. Nil Evicted means an unused slot rather than an unknown victim.",
+      "distinction": "Records one simulated placement decision, not a completed weight transfer; it is an element of an ExpertCacheLRFUPlan result, not the whole transition, and not a trace event that merely names a selected expert.",
+      "distinct_from": [
+        "expertcachekey",
+        "expertcachelrfuplan",
+        "expertcachelrfuentry",
+        "expcache-trace-event"
+      ],
+      "aliases": [],
+      "grounding": "ExpertCacheLRFUFill",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfuplan",
+      "canonical": "ExpertCacheLRFUPlan",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Result of one ExpertCacheLRFU.Plan transition: the resident hit count, the selected layer's token clock before and after the increment, and the ordered list of fill observations. Invalid, capacity, and clock refusals leave policy state unchanged.",
+      "distinction": "Summarizes one policy transition (hits, clock interval, ordered fills) rather than a single fill record or an Inspect observation, and proves nothing about loader I/O or device completion.",
+      "distinct_from": [
+        "expertcachelrfufill",
+        "expertcachelrfuentry",
+        "expertcachelrfuplan-transition",
+        "expertcachelrfu"
+      ],
+      "aliases": [],
+      "grounding": "ExpertCacheLRFUPlan",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfuentry",
+      "canonical": "ExpertCacheLRFUEntry",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Owned scalar snapshot returned by Inspect for one expert: resident slot (-1 when nonresident), resident class as of last use, retained CRF, currently decayed CRF, last-use token (-1 before first access), and layer clock. It is an observation without mutation.",
+      "distinction": "An Inspect observation, not a Plan result; its Class is the last-use resident bucket, not a live recompute as the layer clock ages, and its CRF persists after eviction.",
+      "distinct_from": [
+        "expertcachelrfuplan",
+        "cachelrfu-class-fn",
+        "expertcachelrfu"
+      ],
+      "aliases": [],
+      "grounding": "ExpertCacheLRFUEntry",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "newexpertcachelrfu",
+      "canonical": "NewExpertCacheLRFU",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Constructor validating layers, experts, and residentSlots geometry: all positive, experts <= ExpertCacheLRFUMaxEntries, layers*experts bounded via a division check before allocation, and residentSlots <= layers*experts; refusal returns ErrExpertCacheLRFUConfig. On success it allocates empty slots and zero layer clocks, with all unused slots linked in class 0 and the other seven class lists empty.",
+      "distinction": "Initializes policy metadata only - not weight allocation, cache warm-start, or a per-token Plan transition; its sole refusal is the construction-time ErrExpertCacheLRFUConfig, unlike the access-time input sentinel.",
+      "distinct_from": [
+        "expertcachelrfu",
+        "errexpertcachelrfuconfig",
+        "expertcachelrfumaxentries"
+      ],
+      "aliases": [],
+      "grounding": "NewExpertCacheLRFU",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfuclass",
+      "canonical": "expertCacheLRFUClass (frequency bucket function)",
+      "family": "cache",
+      "kind": "symbol",
+      "definition": "Internal bucket calculation that converts log2 of post-use CRF to float32 before integer truncation and caps the result at the last of eight classes.",
+      "distinction": "This computes frequency class, not victim age score or live class recomputation during Inspect; float32 rounding follows donor bucket boundaries.",
+      "distinct_from": [
+        "expertcachelrfuclasses"
+      ],
+      "aliases": [],
+      "grounding": "expertCacheLRFUClass",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfuplan-transition",
+      "canonical": "ExpertCacheLRFUPlan (policy transition result)",
+      "family": "plan",
+      "kind": "symbol",
+      "definition": "One ExpertCacheLRFU.Plan transition result in modelloadplan: counts logical hits, records the selected layer token-clock interval, and lists ordered fill and eviction decisions.",
+      "distinction": "This is the returned description of one policy transition, not a scheduler execution plan or proof that loader I/O succeeded; the cache-family entry describes its logical residency observations.",
+      "distinct_from": [
+        "expertcachelrfuplan"
+      ],
+      "aliases": [],
+      "grounding": "ExpertCacheLRFUPlan",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    },
+    {
+      "id": "expertcachelrfu-resident-slots",
+      "canonical": "residentSlots (ExpertCacheLRFU constructor)",
+      "family": "session-runtime",
+      "kind": "symbol",
+      "definition": "NewExpertCacheLRFU constructor parameter fixing the number of logical resident expert slots across the policy layers; it must be positive and no greater than layers times experts.",
+      "distinction": "This is simulated expert-residency capacity, not scheduler running-session slots, a byte budget, or device allocation; Plan rejects selections whose distinct experts exceed it.",
+      "distinct_from": [
+        "expertcachelrfu"
+      ],
+      "aliases": [],
+      "grounding": "residentSlots",
+      "grounding_kind": "symbol",
+      "glossary_anchor": "docs/fak/concept-glossary.md",
+      "parent": "",
+      "verdict": "crystal",
+      "gaps": []
+    }
+  ]
+}

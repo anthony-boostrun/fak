@@ -21,6 +21,11 @@ import (
 
 const inKernelCPUPrefixFlightMinShared = 64
 
+// batchDiagAgentEnabled gates the agent-level batch-step diagnostic line
+// (fak_batch_agent_diag) used by the q2kxl concurrency-collapse investigation.
+// Off by default; FAK_BATCH_DIAG=1 turns it on. Pure observation: no behavior change.
+var batchDiagAgentEnabled = os.Getenv("FAK_BATCH_DIAG") == "1"
+
 const inKernelLegacyPrefixFlightNamespace = "legacy/unscoped"
 
 // inKernelPrefixFlightNamespace follows the same tenant ownership boundary as
@@ -770,6 +775,7 @@ type decodeLane struct {
 	// life so every served token reuses the size-V probability row, index permutation
 	// and sort/heap buffers instead of allocating them per token.
 	sampling samplerWorkspace
+	compact  compactSamplingState
 	// forwardCoverageSource is an injected observation seam for the token/coverage
 	// pairing witness. Production leaves it nil and reads the live Session.
 	forwardCoverageSource nativeForwardCoverageSource
@@ -1095,6 +1101,13 @@ func (ln *decodeLane) decodeOne(ctx context.Context) (next int, advance bool) {
 			ln.err, ln.done = ErrNonFiniteLogits, true
 			return 0, false
 		}
+		if ln.compact.ready {
+			if next < 0 || next >= ln.compact.packet.Count {
+				ln.err, ln.done = fmt.Errorf("native sampler: compact index %d outside candidate row", next), true
+				return 0, false
+			}
+			next = ln.compact.packet.IDs[next]
+		}
 	}
 	enginestep.Default.ObservePhase(enginestep.PhaseSample, time.Since(sampleStart))
 	if ln.structured != nil {
@@ -1162,6 +1175,9 @@ func (ln *decodeLane) decodeOne(ctx context.Context) (next int, advance bool) {
 }
 
 func (ln *decodeLane) vocabSize() int {
+	if ln.compact.ready {
+		return ln.vocab
+	}
 	if ln.logits != nil {
 		return len(ln.logits)
 	}
@@ -1185,6 +1201,11 @@ func (ln *decodeLane) step(ctx context.Context, id int) error {
 	if ln.engramAttempt != nil {
 		return ln.stepWithEngramLookAhead(ctx, id)
 	}
+	if ln.deviceSamplingCandidates() {
+		ln.stepSamplingCandidates(id)
+		return nil
+	}
+	ln.compact.ready = false
 	if !ln.deviceGreedy() {
 		ln.logits = ln.s.Step(id)
 		return nil
@@ -1244,7 +1265,7 @@ func (ln *decodeLane) retainGreedyLogits() {
 // continuationLogits returns the distribution after the last forwarded token, reading a
 // device-selected step's retained logits back once.
 func (ln *decodeLane) continuationLogits() []float32 {
-	if ln.logits == nil && ln.greedyReady {
+	if ln.compact.ready || (ln.logits == nil && ln.greedyReady) {
 		return ln.s.TakeGreedyLogits()
 	}
 	return ln.logits
@@ -1321,6 +1342,10 @@ type inKernelDecodeIteration struct {
 	serialSteps    int
 	sharedPanels   int
 	sharedMACs     int64
+	// forwarded counts the lanes the last step or stepSerial actually advanced
+	// through a forward. A round in which every lane only sampled its final
+	// token forwards nothing, so its wall time is not a per-token sample.
+	forwarded int
 }
 
 func newInKernelDecodeIteration(lanes []*decodeLane, m *model.Model, quant bool) *inKernelDecodeIteration {
@@ -1337,10 +1362,64 @@ func newInKernelDecodeIteration(lanes []*decodeLane, m *model.Model, quant bool)
 	return d
 }
 
+// stepSerial advances every active lane through its own Session.Step - the
+// pre-batch serial driver. Per-lane results are bit-for-bit identical to the
+// batched driver (the same contract StepBatchActive pins for StepBatch), so
+// the cohort's adaptive batched->serial degradation changes only wall time.
+// It reports whether any lane advanced.
+func (d *inKernelDecodeIteration) stepSerial(ctx context.Context) bool {
+	anyActive := false
+	d.forwarded = 0
+	var diagLanes int
+	var diagStepSum, diagStepMax time.Duration
+	if batchDiagAgentEnabled {
+		roundStart := time.Now()
+		defer func() {
+			fmt.Fprintf(os.Stderr, "fak_batch_serial_diag lanes=%d step_sum_us=%d step_max_us=%d round_us=%d\n",
+				diagLanes, diagStepSum.Microseconds(), diagStepMax.Microseconds(), time.Since(roundStart).Microseconds())
+		}()
+	}
+	for i, ln := range d.lanes {
+		d.active[i] = false
+		if ln.done || ln.gen >= ln.maxNew {
+			continue // finished lane: dropped from the active set, never re-stepped.
+		}
+		laneCtx := ctx
+		if ln.ctx != nil {
+			laneCtx = ln.ctx
+		}
+		next, advance := ln.decodeOne(laneCtx)
+		if !advance {
+			continue
+		}
+		stepStart := time.Now()
+		if err := ln.step(laneCtx, next); err != nil {
+			ln.err, ln.done = err, true
+			continue
+		}
+		stepDur := time.Since(stepStart)
+		enginestep.Default.ObserveDecodeStep(enginestep.PathSerial, 1, stepDur)
+		diagLanes++
+		diagStepSum += stepDur
+		diagStepMax = max(diagStepMax, stepDur)
+		if ln.logits != nil {
+			ln.vocab = len(ln.logits)
+		}
+		if ln.forwarded != nil {
+			ln.forwarded = append(ln.forwarded, next)
+		}
+		d.active[i] = true
+		d.forwarded++
+		anyActive = true
+	}
+	return anyActive
+}
+
 // step completes at most one shared forward. False means all lanes are terminal;
 // sampling the final emitted token may finish a lane without forwarding it.
 func (d *inKernelDecodeIteration) step(ctx context.Context) bool {
 	lanes, bs, ids, active, greedy := d.lanes, d.bs, d.ids, d.active, d.greedy
+	agentDiagT0 := time.Now()
 	anyActive := false
 	for i, ln := range lanes {
 		active[i] = false
@@ -1359,6 +1438,8 @@ func (d *inKernelDecodeIteration) step(ctx context.Context) bool {
 		active[i] = true
 		anyActive = true
 	}
+	agentDiagSample := time.Since(agentDiagT0)
+	d.forwarded = 0
 	if !anyActive {
 		return false
 	}
@@ -1398,8 +1479,13 @@ func (d *inKernelDecodeIteration) step(ctx context.Context) bool {
 		panels = bs.LastStepSharedPanels()
 		macs = bs.LastStepMACs()
 	}
+	d.forwarded = activeLanes
 	if d.serialSteps == 0 {
 		enginestep.Default.ObserveDecodeStep(enginestep.PathBatched, activeLanes, time.Since(stepStart))
+	}
+	if batchDiagAgentEnabled {
+		fmt.Fprintf(os.Stderr, "fak_batch_agent_diag lanes=%d sample_us=%d step_us=%d total_us=%d\n",
+			activeLanes, agentDiagSample.Microseconds(), time.Since(stepStart).Microseconds(), time.Since(agentDiagT0).Microseconds())
 	}
 	if forwardNow != nil {
 		// This trace preserves outer call provenance and duration even when
@@ -1421,6 +1507,7 @@ func (d *inKernelDecodeIteration) step(ctx context.Context) bool {
 			if ln.logits != nil {
 				ln.vocab = len(ln.logits)
 			}
+			ln.compact.ready = false
 			ln.logits = out[i]
 			ln.greedyReady = next != nil && greedy[i] && out[i] == nil
 			if ln.greedyReady {

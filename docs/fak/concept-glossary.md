@@ -2336,3 +2336,332 @@ Correspondence check between a frozen graph allocation receipt and its capture-b
 Bounds-first correspondence check for a capture-owned immutable K/Kraw/V reservation-ticket prefix and the current dense F32 KV store, geometry and full-capacity plane descriptors. It accepts logical row growth within retained capacity and returns the validated prefix length without reacquiring tickets.
 
 **Distinct from:** Unlike cudaGraphOnceDependency.reservationSlotsMatch checking primary/scale slots for one cudaBuf receipt, this validates all selected KV plane slots and retained store metadata. Native allocation identity is checked separately by the shared batch validator; this method does not prove physical ownership, content, CUDA completion or complete captured producer inventory.
+
+
+### ExpertCacheLRFU
+
+Bounded logical resident-slot replacement policy in modelloadplan, adapted from llama.cpp ClassLRU: eight frequency-class LRU lists retain exponentially decayed CRF across eviction and choose the oldest unselected candidate with largest age divided by two to its class. Plan serializes state changes using per-layer token clocks.
+
+**Distinct from:** This is host-side logical residency planning, not ExpertCacheTier physical weight placement, loader I/O, device synchronization or evidence that weights occupy a returned slot.
+
+
+### ExpertCacheLRFUMaxEntries
+
+Maximum logical layer-times-expert entries accepted by NewExpertCacheLRFU: 1 shifted left by 20, checked using division before allocating arrays.
+
+**Distinct from:** This bounds policy metadata geometry, not the requested resident slot count, byte capacity, or frequency-class count.
+
+
+### expertCacheLRFUClasses
+
+Eight frequency buckets used by ExpertCacheLRFU to organize resident slots into separate LRU lists.
+
+**Distinct from:** The bucket count is not metadata entry capacity and does not encode physical weight-storage tiers.
+
+
+### expertCacheLRFUHalfLife
+
+Float32 value 128 used as the per-layer token-clock half-life when decaying ExpertCacheLRFU CRF with Exp2.
+
+**Distinct from:** This is a token-age decay constant, not wall-clock duration, class count or an eviction deadline.
+
+
+### ErrExpertCacheLRFUConfig
+
+Constructor refusal sentinel for nonpositive geometry, excessive logical entries or resident slots exceeding layer-times-expert entries.
+
+**Distinct from:** This rejects policy construction, unlike ErrExpertCacheLRFUInput which rejects an access to an existing policy.
+
+
+### ErrExpertCacheLRFUInput
+
+Access refusal sentinel for a nil ExpertCacheLRFU, out-of-range layer or expert ID, or negative token increment.
+
+**Distinct from:** This is malformed access input, not valid selections exceeding resident slots or token-clock overflow.
+
+
+### ErrExpertCacheLRFUCapacity
+
+Plan refusal sentinel when distinct selected experts exceed available logical resident slots, before policy state changes.
+
+**Distinct from:** This is selected-set cardinality overflow, not constructor metadata geometry or physical memory allocation failure.
+
+
+### ErrExpertCacheLRFUClock
+
+Plan refusal sentinel when a nonnegative token increment would overflow the selected layer int64 clock.
+
+**Distinct from:** This protects logical token arithmetic, not a timeout, wall-clock fault or resident-capacity refusal.
+
+
+### ExpertCacheKey
+
+Layer and Expert integer pair identifying one logical expert in the ExpertCacheLRFU policy and its fill or eviction observations.
+
+**Distinct from:** This identifies an expert, not a resident slot, physical pointer, payload digest or access-frequency score.
+
+
+### ExpertCacheLRFUFill
+
+One logical cache-plan miss result: selected ExpertCacheKey, assigned slot and optional owned copy of the evicted expert key.
+
+**Distinct from:** This records simulated placement, not completed weight transfer; nil Evicted means an unused slot, not an unknown victim.
+
+
+### ExpertCacheLRFUPlan
+
+Plan result containing resident hit count, layer clock before and after the token increment, and ordered logical fill observations.
+
+**Distinct from:** This summarizes one policy transition rather than a single fill or proof of loader and device completion.
+
+
+### ExpertCacheLRFUEntry
+
+Owned scalar Inspect snapshot of an expert: resident slot/class, retained CRF, current decayed CRF, last-use token and layer clock.
+
+**Distinct from:** This is an observation without mutation, not a Plan result; class remains the last-use resident bucket and CRF persists after eviction.
+
+
+### NewExpertCacheLRFU
+
+Constructor validating layer, expert and slot geometry and allocating the bounded logical ClassLRU policy with empty slots and zero layer clocks.
+
+**Distinct from:** This initializes policy metadata only, not weight allocation, cache warm-start or a per-token Plan transition.
+
+
+### expertCacheLRFUClass (frequency bucket function)
+
+Internal bucket calculation that converts log2 of post-use CRF to float32 before integer truncation and caps the result at the last of eight classes.
+
+**Distinct from:** This computes frequency class, not victim age score or live class recomputation during Inspect; float32 rounding follows donor bucket boundaries.
+
+
+### ExpertCacheLRFUPlan (policy transition result)
+
+One ExpertCacheLRFU.Plan transition result in modelloadplan: counts logical hits, records the selected layer token-clock interval, and lists ordered fill and eviction decisions.
+
+**Distinct from:** This is the returned description of one policy transition, not a scheduler execution plan or proof that loader I/O succeeded; the cache-family entry describes its logical residency observations.
+
+
+### residentSlots (ExpertCacheLRFU constructor)
+
+NewExpertCacheLRFU constructor parameter fixing the number of logical resident expert slots across the policy layers; it must be positive and no greater than layers times experts.
+
+**Distinct from:** This is simulated expert-residency capacity, not scheduler running-session slots, a byte budget, or device allocation; Plan rejects selections whose distinct experts exceed it.
+
+
+### CUBLASLtNVFP4Policy
+
+Shared pure architecture and runtime eligibility rule in fp4meta for the cuBLASLt NVFP4 path: SM100 requires at least version120803, SM103 requires at least version120900, SM120 requires at least version120804, and other architectures are refused. For admitted SM103, skipAlgo66 is true on versions130501 through130601 and130700 through130799.
+
+**Distinct from:** This selects supported architecture/version combinations and known algorithm exclusions; it does not adjudicate FP4 tensor metadata, enqueue a kernel, prove measured hardware support, or change policy thresholds when the compute wrapper delegates to it.
+
+
+### validBytePlan (V41DSparkResidency byte validation)
+
+Pure V41DSparkResidency helper in internal/model/v41_dspark_residency.go checking that declared draft and target byte counts are both nonnegative and their int64 sum is representable before residency admission uses that sum. FitsHost requires it before comparing ResidentBytes with HostBudgetBytes.
+
+**Distinct from:** This establishes arithmetic validity of two declared model byte counts, not SessionResidencyPlan total enforced serving footprint, available host capacity, node-count sufficiency, or proof that weights are loaded; a valid byte plan can still fail FitsHost or resident-claim admission.
+
+
+### ErrGraphCacheNilVoter
+
+Constructor error sentinel in internal/compute/graph_cache_policy.go returned by NewGraphCachePolicy when a nonempty Voters slice contains a nil callback. Validation follows engine, capacity and minimum-retention checks and rejects the policy before any capture or replay. An absent or empty voter slice remains valid single-rank agreement.
+
+**Distinct from:** This reports an invalid graph-capture agreement callback configuration, not CachePolicyStream offline replay input data, a negative runtime rank vote, nil engine, invalid capacity or retention bounds, or a capture/replay engine failure. A non-nil callback returning false is valid and selects eager execution on a cache miss. Callback presence proves neither rank reachability nor hardware consensus.
+
+
+### ErrDeviceMemoryUnsupported
+
+Sentinel returned by the L3 KV host registration planner when a CUDA-resident buffer lacks enabled CUDA support or any installed transport context lacks CUDA-memory capability.
+
+**Distinct from:** This is a typed registration-capability refusal, not a generic support maturity grade, allocation failure, device probe or evidence that a transport executed.
+
+
+### RegistrationContextCaps
+
+Caller-supplied readiness and CUDA-memory capability flags for one installed transport context, consumed across the complete context set by the L3 KV registration planner.
+
+**Distinct from:** This is transport capability metadata, not Go context.Context cancellation plumbing, model context tokens or attestation of device ownership.
+
+
+### MemoryRegistrationPlan
+
+Successful L3 KV registration-planning result containing a scalar copy of buffer metadata, semantic host-or-CUDA interface classification and installed context count.
+
+**Distinct from:** This is a metadata result only, not a SessionResidencyPlan capacity reservation, registration handle, resource lifetime or completed transfer.
+
+
+### PlanMemoryRegistration
+
+Pure L3 KV function validating nonzero representable buffer spans, declared residency and ordinal consistency, and readiness/CUDA capability across the caller-supplied complete context set before returning a MemoryRegistrationPlan.
+
+**Distinct from:** This constructs checked registration metadata, not the passive MemoryRegistrationPlan result itself, a residency capacity plan, live memory registration or host-staging fallback. It cannot discover omitted contexts or prove physical pointer residency; the caller must supply truthful complete metadata.
+
+
+### devbuildcache (target integration semantics)
+
+The fak-dev source-checkout handoff cache implemented by devbuildcache.go: a source mtime/size digest names a linked executable, with a 24-hour TTL and executable-magic lookup check; failures fall back to go run.
+
+**Distinct from:** Linked development-command executable reuse, not model KV tensor storage or a proof that all transitive dependencies are unchanged. The lowercase buildcache path fragment refers to this same artifact cache.
+
+
+### devBuildCachedFakDev (target integration semantics)
+
+Returns a usable cached fak-dev executable and true after enabled-switch, source-digest and path checks, then lookup or build followed by lookup; returns false on any failure so the caller can use its legacy handoff.
+
+**Distinct from:** The orchestration function, not the cache entry path, lookup-only predicate, or an execution of the returned program.
+
+
+### FAK_DEV_BUILDCACHE (target integration semantics)
+
+Environment switch disabling the fak-dev executable cache when trimmed case-insensitive value is off, 0, false or no; other values leave cache use enabled.
+
+**Distinct from:** Controls an optional development handoff optimization, not the Go build cache or a mandatory safety guard.
+
+
+### devBuildCacheTTL (target integration semantics)
+
+The 24-hour duration bounding entry reuse by modification time even when the direct-source digest remains equal.
+
+**Distinct from:** Expiry duration, not the injectable clock, a complete dependency digest or a lease.
+
+
+### devBuildCacheNow (target integration semantics)
+
+Injectable time.Now function used by fak-dev cache lookup to compare entry modification time against its TTL.
+
+**Distinct from:** Clock dependency for age calculation, not the TTL duration or a timer that launches work.
+
+
+### devBuildCacheDirOverride (target integration semantics)
+
+Optional directory override for the fak-dev linked-executable cache; empty uses os.UserCacheDir and tests can supply a fixture directory.
+
+**Distinct from:** Cache base directory override, not the digest-derived entry filename or an access permission.
+
+
+### devBuildCacheBuildFn (target integration semantics)
+
+Injectable function producing the fak-dev executable at the selected output path; production uses devBuildGoBuildFakDev while tests can supply a fake builder.
+
+**Distinct from:** Builder dependency, not cached binary validity, an already completed build, or permission to execute untrusted code.
+
+
+### devBuildCacheDisabled (target integration semantics)
+
+Predicate reading FAK_DEV_BUILDCACHE and recognizing the four disabled spellings after trimming and lowercasing.
+
+**Distinct from:** Switch interpretation only, not an entry expiry or executable-magic test.
+
+
+### devBuildCachePath (target integration semantics)
+
+Derives the fak/dev-buildcache/fak-dev-<digest16> entry pathname under the configured or user cache directory, adding .exe on Windows.
+
+**Distinct from:** Names the entry from the supplied digest; it does not itself read, validate, build or execute the file.
+
+
+### devBuildCacheLookup (target integration semantics)
+
+Checks that a candidate path is a regular file, is no older than devBuildCacheTTL according to devBuildCacheNow, and passes platform executable-magic inspection; returns the path and true only then.
+
+**Distinct from:** Lookup eligibility, not a cryptographic authenticity check, full dependency validation or execution.
+
+
+### AdjudicateAgainstFloor (target integration semantics)
+
+Compares a finite nonnegative observed relative error against a matching-version FloorReceipt with finite nonnegative RelativeError: at or below the receipt value yields within_floor, above yields above_floor; invalid inputs return an error.
+
+**Distinct from:** Numerical port-versus-reference floor comparison, not a hardware capability census, security permission or permission to ignore an invalid receipt.
+
+
+### promptPanelWitnessReason (target integration semantics)
+
+Integer enumeration identifying the selected outcome and each ordered refusal axis of Session.promptPanelFor; it indexes the fixed atomic selection counter array.
+
+**Distinct from:** Selection outcome identity, not an execution-success proof, a counter value or the array size sentinel.
+
+
+### promptPanelWitnessReasons (target integration semantics)
+
+Terminal enumeration value sizing the prompt-panel selection counter array after the selected outcome and all refusal reasons.
+
+**Distinct from:** Count of defined reason slots, not a real selected/refused outcome or observed prompt total.
+
+
+### promptPanelWitness (target integration semantics)
+
+Fixed array of atomic.Int64 counters indexed by promptPanelWitnessReason; notePromptPanelSelection increments the selected reason once at each selector outcome.
+
+**Distinct from:** Process-local selection counters, not downstream execution witnesses, performance measurements or synchronized global snapshots.
+
+
+### PromptPanelSelectionWitness (target integration semantics)
+
+Returns PromptPanelSelectionCounts by loading each reason counter atomically; later fields may include calls arriving between loads.
+
+**Distinct from:** Race-free field reads rather than a single-time consistent snapshot or proof that selected panels completed execution.
+
+
+### promptPanelRefusalArchQ8TokenLoop (target integration semantics)
+
+Prompt-panel refusal enumeration recorded when q8PrefillNeedsTokenLoop(cfg) is true in the ordered non-panel-MoE architecture checks, after earlier selection checks have passed.
+
+**Distinct from:** A first-matching selector refusal reason, not the architecture predicate itself, a runtime fault or a count of all models satisfying that predicate.
+
+
+### ArchQ8TokenLoop (target integration semantics)
+
+Field of PromptPanelSelectionCounts loaded from the promptPanelRefusalArchQ8TokenLoop counter; counts calls attributed to that first-matching prompt-panel refusal axis.
+
+**Distinct from:** Snapshot counter for a selector refusal, not an architecture configuration flag, kernel layout or completed-token loop count.
+
+
+### promptPanelRefusalArchMLAMoELayout (target integration semantics)
+
+Prompt-panel refusal enumeration recorded when cfg.usesMLAMoELayout() is true in the ordered non-panel-MoE architecture checks, after earlier selection checks have passed.
+
+**Distinct from:** A first-matching selector refusal reason, not the architecture predicate itself, a runtime fault or a count of all models satisfying that predicate.
+
+
+### ArchMLAMoELayout (target integration semantics)
+
+Field of PromptPanelSelectionCounts loaded from the promptPanelRefusalArchMLAMoELayout counter; counts calls attributed to that first-matching prompt-panel refusal axis.
+
+**Distinct from:** Snapshot counter for a selector refusal, not an architecture configuration flag, kernel layout or completed-token loop count.
+
+
+### promptPanelRefusalArchMiniMaxSparseAttn (target integration semantics)
+
+Prompt-panel refusal enumeration recorded when cfg.isMiniMaxSparseAttn() is true in the ordered non-panel-MoE architecture checks, after earlier selection checks have passed.
+
+**Distinct from:** A first-matching selector refusal reason, not the architecture predicate itself, a runtime fault or a count of all models satisfying that predicate.
+
+
+### ArchMiniMaxSparseAttn (target integration semantics)
+
+Field of PromptPanelSelectionCounts loaded from the promptPanelRefusalArchMiniMaxSparseAttn counter; counts calls attributed to that first-matching prompt-panel refusal axis.
+
+**Distinct from:** Snapshot counter for a selector refusal, not an architecture configuration flag, kernel layout or completed-token loop count.
+
+
+### CachedPayloadBytes (target integration semantics)
+
+Field of tokenizer.EncodeWork accumulating logical bytes retained for ordinary-run memo entries: UTF-8 text bytes plus token-ID count times native int width, subject to the one-MiB payload budget.
+
+**Distinct from:** Logical retained key/ID payload, not heap usage, map overhead, total tokenizer input or an inference KV cache.
+
+
+### fak_gateway_inference_output_tokens (per-turn histogram; guard-gate)
+
+Prometheus histogram of positive completion-token counts per accounted gateway model turn. observeInferenceTokenCountsLocked records the same completion-count axis as fak_gateway_inference_completion_tokens_total under inferenceMu; the render path exports cumulative buckets, sum and count. Synthetic accounted turns are included; omitted, zero and negative counts are excluded.
+
+**Distinct from:** A per-turn output-token count distribution, not aggregate completion tokens, output tokens per second, prompt-token provenance or a latency histogram. Despite its gateway/guard vocabulary, this metric does not authorize admission, prove a runtime feature executed, or establish real GPU throughput.
+
+
+### fak_gateway_inference_output_tokens (per-turn histogram; gateway-engine)
+
+Prometheus histogram of positive completion-token counts per accounted gateway model turn. observeInferenceTokenCountsLocked records the same completion-count axis as fak_gateway_inference_completion_tokens_total under inferenceMu; the render path exports cumulative buckets, sum and count. Synthetic accounted turns are included; omitted, zero and negative counts are excluded.
+
+**Distinct from:** A per-turn output-token count distribution, not aggregate completion tokens, output tokens per second, prompt-token provenance or a latency histogram. Despite its gateway/guard vocabulary, this metric does not authorize admission, prove a runtime feature executed, or establish real GPU throughput. The guard-gate row for this token is a second vocabulary position of this same histogram, not another metric or a guard decision.

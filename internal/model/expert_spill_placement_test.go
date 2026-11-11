@@ -3,6 +3,8 @@ package model
 import (
 	"errors"
 	"testing"
+
+	"github.com/anthony-chaudhary/fak/internal/compute"
 )
 
 // expert_spill_placement_test.go — the R1 witnesses for #5612 (epic #5606). R0 bounded the activated set
@@ -80,6 +82,74 @@ func TestExpertSpillLayersAreMoEOrdinals(t *testing.T) {
 		if got := onHost(c.name); got != c.want {
 			t.Errorf("graded onHost(%q) = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// fak-test:runtime fast est=1s lane=default
+func TestExpertSpillQ2ResidentLayers(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		name := "q2_only"
+		if mixed {
+			name = "mixed_stores"
+		}
+		t.Run(name, func(t *testing.T) {
+			shared := "model.layers.1.mlp.shared_experts.gate_proj.weight"
+			dense := layerName(0, "self_attn.q_proj.weight")
+			m := &Model{q2w: map[string]*q2Tensor{
+				expertName(6, 0, "up_proj.weight"):   {raw: make([]byte, 34)},
+				expertName(2, 0, "gate_proj.weight"): {q: make([]byte, 8), d: []float32{1}},
+				expertName(4, 0, "down_proj.weight"): {raw: make([]byte, 34)},
+				shared:                               {raw: make([]byte, 34)},
+				dense:                                {raw: make([]byte, 34)},
+				"lm_head.weight":                     {raw: make([]byte, 34)},
+			}}
+			want := []int{2, 4, 6}
+			if mixed {
+				m.q4kw = map[string]*q4kTensor{
+					expertName(4, 1, "up_proj.weight"): {raw: make([]byte, 144)},
+					expertName(8, 0, "up_proj.weight"): {raw: make([]byte, 144)},
+				}
+				want = append(want, 8)
+			}
+			replicated, expert, resident := m.MoEResidentWeightBytes()
+			if !resident || expert <= 0 {
+				t.Fatalf("fixture has no routed resident bytes: resident=%v expert=%d", resident, expert)
+			}
+			// Use the loaded-model resolver before inspecting its layer set: Q2-only
+			// models used to skip placement even with real resident expert bytes.
+			p, ok, err := m.ResolveExpertSpillPlacement(replicated+expert, 2)
+			if err != nil || !ok {
+				t.Fatalf("ResolveExpertSpillPlacement: ok=%v err=%v", ok, err)
+			}
+			if p.Budget.MoELayers != len(want) || p.Fit.SpillLayers != 2 || !p.Fit.Fits {
+				t.Fatalf("placement = %+v, want %d MoE layers and two spilled", p, len(want))
+			}
+			got := m.MoEExpertLayers()
+			if len(got) != len(want) {
+				t.Fatalf("MoEExpertLayers() = %v, want %v", got, want)
+			}
+			for i, layer := range want {
+				if got[i] != layer {
+					t.Fatalf("MoEExpertLayers() = %v, want sorted unique %v", got, want)
+				}
+			}
+			s := &Session{M: m}
+			s.ApplyExpertSpillPlacement(p)
+			if !s.CPUOffloadExperts || s.ExpertSpillLayers != 2 || s.ExpertRingBytes != p.RingBytes {
+				t.Fatal("resolved placement was not installed")
+			}
+			onHost := s.expertSpillOnHost()
+			for i, layer := range want {
+				if got := onHost(expertName(layer, 0, "gate_proj.weight")); got != (i < 2) {
+					t.Errorf("layer %d host placement = %v, want %v", layer, got, i < 2)
+				}
+			}
+			for _, name := range []string{shared, dense, "lm_head.weight"} {
+				if onHost(name) {
+					t.Errorf("non-routed Q2 tensor %q was spilled", name)
+				}
+			}
+		})
 	}
 }
 
@@ -310,5 +380,69 @@ func TestPlanExpertSpillRefusesOutOfRangeN(t *testing.T) {
 	}
 	if p.Fit.SpillLayers != 1 {
 		t.Fatalf("explicit N=1 resolved to spill=%d", p.Fit.SpillLayers)
+	}
+}
+
+// fak-test:runtime fast est=1ms lane=default
+func TestApplyExpertSpillPlacementReplacesDispatch(t *testing.T) {
+	layers := []int{2, 5, 8, 11}
+	m := expertSpillTestModel(layers, []int{0, 1}, 2, 128)
+	plans := make([]ExpertSpillPlacement, len(layers)+1)
+	for n := range plans {
+		p, ok, err := m.ResolveExpertSpillPlacement(1<<30, n)
+		if err != nil || !ok {
+			t.Fatalf("resolve spill=%d: ok=%v err=%v", n, ok, err)
+		}
+		plans[n] = p
+	}
+
+	for _, tc := range []struct {
+		name    string
+		backend compute.Backend
+	}{
+		{name: "resident"},
+		{name: "backend", backend: compute.Default()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Session{M: m, Backend: tc.backend, CPUOffloadExperts: true}
+			if _, ok := s.glmDsaMatKernel().(splitKernel); !ok {
+				t.Fatal("ungraded legacy offload no longer selects the split")
+			}
+			// Reuse one session: clear a legacy bit, then exercise partial-to-partial,
+			// partial-to-zero, zero-to-full and full-to-zero replacements.
+			for _, n := range []int{0, 1, 2, 0, 4, 0} {
+				p := plans[n]
+				s.ApplyExpertSpillPlacement(p)
+				if s.CPUOffloadExperts != (n > 0) || s.ExpertSpillLayers != n || s.ExpertRingBytes != p.RingBytes {
+					t.Errorf("spill=%d: offload=%v layers=%d ring=%d; want %v/%d/%d", n,
+						s.CPUOffloadExperts, s.ExpertSpillLayers, s.ExpertRingBytes, n > 0, n, p.RingBytes)
+				}
+				k := s.glmDsaMatKernel()
+				split, isSplit := k.(splitKernel)
+				if isSplit != (n > 0) {
+					t.Errorf("spill=%d: selected %T, want split=%v", n, k, n > 0)
+					continue
+				}
+				if !isSplit {
+					if tc.backend != nil {
+						if _, ok := k.(backendKernel); !ok {
+							t.Errorf("zero spill selected %T, want all-device backendKernel", k)
+						}
+					} else if _, ok := k.(sessionResidentKernel); !ok {
+						t.Errorf("zero spill selected %T, want sessionResidentKernel", k)
+					}
+					continue
+				}
+				for i, layer := range layers {
+					name := expertName(layer, 0, "gate_proj.weight")
+					if got := split.onHost(name); got != (i < n) {
+						t.Errorf("spill=%d: host(%s)=%v, want %v", n, name, got, i < n)
+					}
+				}
+				if split.onHost("model.layers.2.mlp.shared_experts.gate_proj.weight") || split.onHost(routerName(2)) {
+					t.Errorf("spill=%d: shared expert or router moved to host", n)
+				}
+			}
+		})
 	}
 }

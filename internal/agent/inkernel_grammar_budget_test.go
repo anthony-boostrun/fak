@@ -15,6 +15,31 @@ import (
 	"github.com/anthony-chaudhary/fak/internal/model"
 )
 
+// fak-test:runtime fast est=1ms lane=default
+func TestNativeGrammarBudgetKeyPreservesLimitWidth(t *testing.T) {
+	t.Parallel()
+	prefix := []int{1, 7, 9}
+	key := nativeGrammarBudgetKey(prefix, 2047)
+	if key != nativeGrammarBudgetKey(append([]int(nil), prefix...), 2047) {
+		t.Fatal("equal memo coordinates produced different keys")
+	}
+	if key == nativeGrammarBudgetKey(prefix, 2048) || key == nativeGrammarBudgetKey([]int{1, 7, 8}, 2047) || key == nativeGrammarBudgetKey([]int{1, 7}, 2047) {
+		t.Fatal("distinct memo coordinates collided")
+	}
+	large := int64(1<<32) + 2047
+	if large > int64(int(^uint(0)>>1)) {
+		t.Skip("large limit is not representable on this native-int width")
+	}
+	largeKey := nativeGrammarBudgetKey(prefix, int(large))
+	if largeKey == key {
+		t.Fatal("64-bit remaining budget reused a truncated 32-bit key")
+	}
+	memo := map[string]int{key: 2048, largeKey: 4096}
+	if len(memo) != 2 || memo[key] != 2048 || memo[largeKey] != 4096 {
+		t.Fatal("distinct capped completion results aliased")
+	}
+}
+
 func nativeGrammarBudgetGBNF(t *testing.T, p *InKernelPlanner, source string) *nativeStructuredConstraint {
 	t.Helper()
 	stops := StopIDs(p.tok, p.m.Cfg)
@@ -57,6 +82,53 @@ func (m nativeGrammarBudgetEndlessMask) MaskLogits(history []int, logits []float
 
 // fak-test:runtime fast est=300ms lane=default
 func TestGrammarBudgetWithinMaxTokens(t *testing.T) {
+	t.Run("fork_probe_and_emission_isolation", func(t *testing.T) {
+		p := nativeStructuredTestPlanner(t)
+		stops := StopIDs(p.tok, p.m.Cfg)
+		c := nativeGrammarBudgetGBNF(t, p, `root ::= "ok"`)
+		if err := c.armGrammarBudget(p, 3); err != nil {
+			t.Fatal(err)
+		}
+		step := func(c *nativeStructuredConstraint, token string) {
+			t.Helper()
+			logits, err := c.maskLogits(make([]float32, p.m.Cfg.VocabSize), stops)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := nativeGrammarBudgetEncode(t, p, token)
+			if !nativeStructuredLogitFinite(logits[id]) {
+				t.Fatalf("token %q masked", token)
+			}
+			if err := c.accept(id, logits); err != nil {
+				t.Fatal(err)
+			}
+		}
+		step(c, "o")
+		fork := c.fork()
+		if fork.budget == c.budget || fork.budget.probe != c.budget.probe || fork.budget.emitted != 1 || fork.budget.maxTokens != 3 {
+			t.Fatal("fork must share probe/memo but copy budget state")
+		}
+		step(fork, "k")
+		if fork.budget.emitted != 2 || c.budget.emitted != 1 || len(c.history) != 1 {
+			t.Fatal("fork acceptance changed parent emission/history")
+		}
+		fork.reset()
+		if fork.budget.emitted != 0 || c.budget.emitted != 1 {
+			t.Fatal("fork reset changed parent")
+		}
+		step(c, "k")
+		if c.budget.emitted != 2 || fork.budget.emitted != 0 {
+			t.Fatal("parent acceptance changed fork")
+		}
+	})
+	t.Run("out_of_range_eos", func(t *testing.T) {
+		p := nativeStructuredTestPlanner(t)
+		c := nativeGrammarBudgetGBNF(t, p, `root ::= "a"`)
+		c.stopID = p.m.Cfg.VocabSize
+		if err := c.armGrammarBudget(p, 16); !errors.Is(err, ErrNativeGrammarBudgetABI) || !errors.Is(err, ErrNativeGrammarBudget) {
+			t.Fatalf("err = %v, want ABI refusal", err)
+		}
+	})
 	t.Run("refusals", func(t *testing.T) {
 		p := nativeStructuredTestPlanner(t)
 		raw := nativeGBNFRaw(t, `root ::= "a"`)

@@ -86,7 +86,10 @@ func writeTemp(t *testing.T, name, content string) string {
 }
 
 func TestDeriveProbes(t *testing.T) {
+	// Explicit fail_closed keeps the classic DEFAULT_DENY trailing probe; the
+	// shipped default_open variant is pinned by TestDeriveProbesDefaultOpenPosture.
 	manifest := `{
+		"posture": "fail_closed",
 		"allow": ["read_record"],
 		"allow_prefix": ["search_", "get_"],
 		"deny": { "delete_all": "POLICY_BLOCK", "exfiltrate": "SECRET_EXFIL" }
@@ -117,6 +120,52 @@ func TestDeriveProbes(t *testing.T) {
 				t.Fatalf("allow probe %q expect = %q, want allow", p.Tool, p.Expect)
 			}
 		}
+	}
+}
+
+// TestDeriveProbesDefaultOpenPosture pins the posture-aware trailing probe: a
+// manifest that ships default_open admits an unlisted name by default, so the
+// derived witness probe expects ALLOW (the open posture is the witness) rather
+// than the DEFAULT_DENY a fail-closed floor owes.
+// TestDeriveProbesOmittedPostureResolvesDefaultOpen pins the ticket's flip at
+// the attest seam: a manifest that OMITS posture now resolves to default_open,
+// so the unmatched-name witness expects ALLOW instead of the classic
+// DEFAULT_DENY.
+func TestDeriveProbesOmittedPostureResolvesDefaultOpen(t *testing.T) {
+	manifest := `{
+		"allow": ["read_record"],
+		"deny": { "exfiltrate": "SECRET_EXFIL" }
+	}`
+	probes, err := deriveProbes([]byte(manifest))
+	if err != nil {
+		t.Fatalf("deriveProbes: %v", err)
+	}
+	last := probes[len(probes)-1]
+	if last.Tool != "__fak_attest_unmatched__" || last.Origin != "default_open" || last.Expect != "allow" {
+		t.Fatalf("omitted-posture trailing probe = %+v, want origin=default_open/allow", last)
+	}
+}
+
+func TestDeriveProbesDefaultOpenPosture(t *testing.T) {
+	manifest := `{
+		"posture": "default_open",
+		"allow": ["read_record"],
+		"deny": { "exfiltrate": "SECRET_EXFIL" }
+	}`
+	probes, err := deriveProbes([]byte(manifest))
+	if err != nil {
+		t.Fatalf("deriveProbes: %v", err)
+	}
+	// 1 deny + 1 allow + 1 default_open = 3.
+	if len(probes) != 3 {
+		t.Fatalf("probe count = %d, want 3: %+v", len(probes), probes)
+	}
+	last := probes[len(probes)-1]
+	if last.Origin != "default_open" || last.Expect != "allow" {
+		t.Fatalf("trailing probe = %+v, want origin=default_open/allow", last)
+	}
+	if last.ExpectReason != "" {
+		t.Fatalf("default_open probe carries ExpectReason=%q, want none", last.ExpectReason)
 	}
 }
 

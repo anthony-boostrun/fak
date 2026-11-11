@@ -363,6 +363,7 @@ void fcuda_qwen35_gdn_test_fault(int stage);
  * global-state kernel where the register-state kernel would run; the counter reports
  * register-state launches, so a test can prove which path a decode took. */
 void fcuda_qwen35_gdn_decode_force_global_state(int on);
+void fcuda_qwen35_gdn_rowdot_force(int mode);
 size_t fcuda_qwen35_gdn_decode_register_state_launches(void);
 
 /* y[P,out] = x[P,in] @ W[out,in]^T   (all row-major f32) via cuBLAS SGEMM. */
@@ -922,6 +923,15 @@ int fcuda_nccl_pg_allreduce_f32(void *dbuf, int count);
  * a later fcuda_nccl_pg_init can form a fresh group. Safe to call when no group is active
  * (no-op). Called on serve shutdown. */
 void fcuda_nccl_pg_destroy(void);
+
+/* Checked raw top-k+1 transport for the opt-in serial sampler. */
+size_t fcuda_sampling_candidates_workspace_bytes(void);
+int fcuda_sampling_candidates_capability(void);
+/* Read and latch pending non-OOM allocation errors before owner release. */
+int fcuda_sampling_candidates_allocation_status(void);
+int fcuda_sampling_candidates(const uint32_t *row, int vocab, int k,
+    void *workspace, uint32_t *retained, uint32_t *host_words);
+int fcuda_sampling_candidates_release(void *owned);
 
 #ifdef __cplusplus
 }

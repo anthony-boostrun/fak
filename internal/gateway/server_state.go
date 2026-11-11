@@ -388,11 +388,35 @@ type Server struct {
 	// (prefix_reuse_attribution.go). Zero value is ready.
 	prefixReuse                  prefixReuseAttribution
 	workspaceAdmissionPermissive bool
-	featureCatalog               atomic.Pointer[FeatureCatalog]
-	responsesContinuationOnce    sync.Once
-	responsesContinuations       *responsesContinuationStore
-	remoteMaintenanceMu          sync.RWMutex
-	remoteMaintenanceAuthority   remotemaint.Authority
+	// workspaceAdmissionMode is the resolved gateway lease-admission posture
+	// (open|permissive|strict; zero value resolves to the open default). It
+	// drives every admission decision; the legacy permissive bool above is
+	// retained for compat and test assertions only.
+	workspaceAdmissionMode WorkspaceAdmissionMode
+	// toolGuardOff mirrors Config.ToolGuard resolved OFF (raw pass-through):
+	// no proposed-call adjudication and no inbound-result admission run on the
+	// served path. Zero value (guard armed) preserves the historical floor.
+	toolGuardOff bool
+	// ctxPagingMode mirrors Config.CtxPaging resolved ("auto"|"on"|"off"): the
+	// oversize-paging posture consulted when neither the per-request
+	// X-Fak-Ctx-Paging header nor the FAK_CTX_PAGING process env names a mode.
+	// Empty config resolves AUTO (the library default); `fak serve` passes OFF
+	// (the serving router does not page tool results into restore stubs).
+	ctxPagingMode string
+	// chatToolResultElideOff mirrors Config.ChatToolResultElide resolved OFF:
+	// the chat/responses tool-result elision never rewrites a message and the
+	// restore tool is never auto-advertised (only recovered from markers the
+	// history already carries). Zero value (armed) preserves the historical
+	// elider byte-for-byte.
+	chatToolResultElideOff bool
+	// sessionLane mirrors Config.SessionLane: the launch-time lane designation
+	// stamped as trusted Meta["lane"] on every served tool call. Empty = unset.
+	sessionLane                string
+	featureCatalog             atomic.Pointer[FeatureCatalog]
+	responsesContinuationOnce  sync.Once
+	responsesContinuations     *responsesContinuationStore
+	remoteMaintenanceMu        sync.RWMutex
+	remoteMaintenanceAuthority remotemaint.Authority
 
 	nativeProgress  nativeProgressReplay
 	k               *kernel.Kernel
@@ -952,6 +976,8 @@ type Server struct {
 	// bounded head+tail form (agent.ElideAnthropicResults), keeping the cached-prefix bytes
 	// verbatim and never touching a cache_control-bearing message. 0 leaves the body
 	// byte-for-byte unchanged. The bounded-loss sibling of compactHistoryBudget.
+	// modelPassthrough mirrors Config.ModelPassthrough (see forwardsRequestModel).
+	modelPassthrough bool
 	elideResultBytes int
 
 	// elideStaleReads mirrors Config.ElideStaleReads: when true the flagship Anthropic passthrough

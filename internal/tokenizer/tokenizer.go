@@ -354,6 +354,10 @@ func writeIdentityPart(h interface{ Write([]byte) (int, error) }, value string) 
 // tokens are matched literally, normal text is split by the model's pre-tokenizer,
 // then merged by tokenizer.json ranks.
 func (t *Tokenizer) Encode(text string) ([]int, error) {
+	return t.encode(text, nil)
+}
+
+func (t *Tokenizer) encode(text string, memo *encodeRunMemo) ([]int, error) {
 	if t.spm != nil {
 		return t.EncodeSPM(text, false, true)
 	}
@@ -379,6 +383,11 @@ func (t *Tokenizer) Encode(text string) ([]int, error) {
 		}
 		chunk := text[:nextAdded]
 		text = text[nextAdded:]
+		if cached, ok := memo.lookup(chunk); ok {
+			ids = append(ids, cached...)
+			continue
+		}
+		chunkStart := len(ids)
 		// Metaspace (Gemma 4) BPEs the whole chunk on the ▁-marked literal text; the
 		// GPT-2 ByteLevel path splits into regex pieces and remaps bytes to its alphabet.
 		pieces := []string{chunk}
@@ -386,9 +395,11 @@ func (t *Tokenizer) Encode(text string) ([]int, error) {
 			pieces = split(chunk)
 		}
 		for _, piece := range pieces {
-			encoded := byteLevelEncode(piece)
+			var encoded string
 			if t.metaspace {
 				encoded = metaspaceEncode(piece)
+			} else {
+				encoded = byteLevelEncode(piece)
 			}
 			if t.ignoreMerges {
 				if id, ok := t.tokenToID[encoded]; ok {
@@ -408,6 +419,7 @@ func (t *Tokenizer) Encode(text string) ([]int, error) {
 				ids = append(ids, id)
 			}
 		}
+		memo.remember(chunk, ids[chunkStart:])
 	}
 	return ids, nil
 }
@@ -502,9 +514,11 @@ func (t *Tokenizer) appendOrdinary(ids []int, chunk string, added map[int]bool) 
 		pieces = split(chunk)
 	}
 	for _, piece := range pieces {
-		encoded := byteLevelEncode(piece)
+		var encoded string
 		if t.metaspace {
 			encoded = metaspaceEncode(piece)
+		} else {
+			encoded = byteLevelEncode(piece)
 		}
 		if t.ignoreMerges {
 			if id, ok := t.tokenToID[encoded]; ok && !added[id] {

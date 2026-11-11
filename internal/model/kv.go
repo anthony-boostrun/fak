@@ -185,6 +185,7 @@ type Session struct {
 	halFailure error
 	// retainGreedyLogits keeps each device-selected StepGreedy distribution as the owned
 	// device clone greedyLogits until the next step, TakeGreedyLogits or Close.
+	// Compact sampled steps reuse this single-owner slot after checked completion.
 	retainGreedyLogits   bool
 	greedyLogits         compute.Tensor
 	executionPolicy      ExecutionPolicy
@@ -678,8 +679,9 @@ func (s *Session) SetRetainGreedyLogits(on bool) {
 	}
 }
 
-// TakeGreedyLogits reads back the distribution of the most recent retained StepGreedy
-// and releases its device copy. It returns nil when no distribution is retained.
+// TakeGreedyLogits reads back the most recent retained device distribution
+// (greedy selection or compact sampling) and releases its device copy.
+// It returns nil when no distribution is retained.
 func (s *Session) TakeGreedyLogits() []float32 {
 	if s == nil || s.greedyLogits.Buf() == nil {
 		return nil
@@ -1205,9 +1207,11 @@ func (s *Session) prefillOwnedContext(ctx context.Context, ids []int) []float32 
 		// one pass — each weight super-block dequantized once and reused across all P prompt
 		// tokens. Architectures the batched q4 lane does not yet cover (MoE / DenseMLP /
 		// Alibi / Qwen35-hybrid / non-PreNorm / layer-specific RoPE theta) fall back to the
-		// per-token blockStep, exactly as the Q8 token-loop fallback does. The LM head is
-		// whichever resident format it loaded as (headResident).
-		if !q8PrefillNeedsTokenLoop(s.M.Cfg) {
+		// per-token blockStep, exactly as the Q8 token-loop fallback does; the
+		// prefillBatchedMoEOK MoE subset is batched too, its routed FFN run per row on the
+		// token loop's kernel. The LM head is whichever resident format it loaded as
+		// (headResident).
+		if !s.prefillNeedsTokenLoop() {
 			return s.headResident(s.prefillBatchedQ4K(ids))
 		}
 		// Qwen3.5/3.6 hybrid (the q8PrefillNeedsTokenLoop case the generic batched-Q4K lane
@@ -1244,18 +1248,19 @@ func (s *Session) prefillOwnedContext(ctx context.Context, ids []int) []float32 
 		if s.q8Qwen35HybridPrefillSessionOK(len(ids)) {
 			return s.prefillQwen35HybridQ(ids)
 		}
-		if cfg := s.M.Cfg; q8PrefillNeedsTokenLoop(cfg) {
+		if s.prefillNeedsTokenLoop() {
 			return s.headQ(s.tokenLoopHidden(s.tokenHiddenQ, ids))
 		}
 		return s.headQ(s.prefillBatchedQ(ids))
 	}
-	if q8PrefillNeedsTokenLoop(s.M.Cfg) {
+	if s.prefillNeedsTokenLoop() {
 		// The batched f32 GEMM is one-weight-many-rows and still hardcodes the PreNorm
-		// block copy and one shared RoPE table. MoE routes each token to its own top-k
-		// experts, DenseMLP removes the up-projection, ALiBi replaces RoPE with score
-		// bias, non-PreNorm topology changes the residual/norm graph, and Gemma3-style
-		// per-layer RoPE theta changes the rotation by layer; these axes run through
-		// blockStep here, where the FFN/topology/RoPE dispatch lives.
+		// block copy and one shared RoPE table. DenseMLP removes the up-projection, ALiBi
+		// replaces RoPE with score bias, non-PreNorm topology changes the residual/norm
+		// graph, and Gemma3-style per-layer RoPE theta changes the rotation by layer; these
+		// axes run through blockStep here, where the FFN/topology/RoPE dispatch lives. The
+		// prefillBatchedMoEOK subset is the exception: its attention is batched and its
+		// routed FFN runs per row through blockStep's exact call.
 		return s.prefillTokenLoop(ids)
 	}
 	// PreNorm (default): batched + parallel, one GEMM over all P tokens instead of
@@ -1367,7 +1372,7 @@ func (s *Session) prefillNoLogitsOwnedContext(ctx context.Context, ids []int) {
 		return
 	}
 	if s.Q4K {
-		if !q8PrefillNeedsTokenLoop(s.M.Cfg) {
+		if !s.prefillNeedsTokenLoop() {
 			s.prefillBatchedQ4K(ids)
 			return
 		}
@@ -1405,7 +1410,7 @@ func (s *Session) prefillNoLogitsOwnedContext(ctx context.Context, ids []int) {
 			s.prefillQwen35HybridQNoLogits(ids)
 			return
 		}
-		if q8PrefillNeedsTokenLoop(s.M.Cfg) {
+		if s.prefillNeedsTokenLoop() {
 			for _, id := range ids {
 				s.tokenHiddenQ(id, s.Cache.Len())
 			}
@@ -1414,7 +1419,7 @@ func (s *Session) prefillNoLogitsOwnedContext(ctx context.Context, ids []int) {
 		s.prefillBatchedQ(ids)
 		return
 	}
-	if q8PrefillNeedsTokenLoop(s.M.Cfg) {
+	if s.prefillNeedsTokenLoop() {
 		for _, id := range ids {
 			s.tokenHidden(id, s.Cache.Len())
 		}
@@ -1425,6 +1430,56 @@ func (s *Session) prefillNoLogitsOwnedContext(ctx context.Context, ids []int) {
 
 func q8PrefillNeedsTokenLoop(cfg Config) bool {
 	return cfg.IsMoE() || cfg.DenseMLP || cfg.Alibi || cfg.IsQwen35Hybrid() || cfg.AttnOutputGate || cfg.BlockTopology != PreNorm || cfg.hasLayerSpecificRopeTheta()
+}
+
+// prefillNeedsTokenLoop gates the batched host prefill lanes (f32 prefillBatched, Q8
+// prefillBatchedQ, resident-Q4_K prefillBatchedQ4K). It keeps every
+// q8PrefillNeedsTokenLoop refusal except the MoE subset prefillBatchedMoEOK admits; the
+// HAL prompt panel keeps calling q8PrefillNeedsTokenLoop.
+func prefillNeedsTokenLoop(m *Model) bool {
+	return q8PrefillNeedsTokenLoop(m.Cfg) && !prefillBatchedMoEOK(m)
+}
+
+// prefillNeedsTokenLoop is the session form the batched prefill callers use. An admitted
+// MoE session with a hidden-state tap, an enabled residual hook, or target-hidden capture
+// keeps the token loop, because only blockStep / tokenHidden* invoke those observers; the
+// MoE admission must not silently drop them where the token loop used to run them.
+func (s *Session) prefillNeedsTokenLoop() bool {
+	cfg := s.M.Cfg
+	if !q8PrefillNeedsTokenLoop(cfg) {
+		return false
+	}
+	if s.activeTap() != nil || s.captureTargetHidden || (cfg.EnableResidualHook && cfg.residualHook != nil) {
+		return true
+	}
+	return !prefillBatchedMoEOK(s.M)
+}
+
+// prefillBatchedMoEOK names the MoE arches whose every non-FFN axis the batched prefill
+// lanes already model, so batching their attention sublayer and running the FFN per row
+// through ffnForLayer(l).apply with the token loop's own kernel (prefillRowFFN) matches
+// blockStep: bit-identical on f32Kernel, and within the lane's existing quantized-batched
+// tolerance on q8Kernel. Families
+// with their own attention or session path (MLA/DSA, MiniMax sparse attention, Gemma4,
+// DeepSeek-V4/V4.1), attention sinks (GPT-OSS, or any layer carrying self_attn.sinks,
+// which the batched softmax does not apply), or linear-attention layers keep the
+// token loop.
+func prefillBatchedMoEOK(m *Model) bool {
+	cfg := m.Cfg
+	if !cfg.IsMoE() || cfg.DenseMLP || cfg.Alibi || cfg.IsQwen35Hybrid() || cfg.AttnOutputGate ||
+		cfg.BlockTopology != PreNorm || cfg.hasLayerSpecificRopeTheta() {
+		return false
+	}
+	if cfg.usesMLAMoELayout() || cfg.isMiniMaxSparseAttn() || cfg.isGemma4() || cfg.isGPTOSS() ||
+		cfg.IsDeepSeekV4() || cfg.IsDeepSeekV41() {
+		return false
+	}
+	for l := 0; l < cfg.NumLayers; l++ {
+		if cfg.isLinearAttnLayer(l) || m.has(layerName(l, "self_attn.sinks")) {
+			return false
+		}
+	}
+	return true
 }
 
 // tokenLoopHidden feeds ids through step one at a time, each at the cache's CURRENT
@@ -1442,7 +1497,7 @@ func (s *Session) tokenLoopHidden(step func(id, pos int) []float32, ids []int) [
 
 // prefillTokenLoop runs the per-token f32 forward (tokenHidden) over ids in cache order and
 // returns the head logits of the final token — the non-batched prefill path taken by the
-// arches q8PrefillNeedsTokenLoop selects out of the one-GEMM batched lane.
+// arches prefillNeedsTokenLoop selects out of the one-GEMM batched lane.
 func (s *Session) prefillTokenLoop(ids []int) []float32 {
 	return s.head(s.tokenLoopHidden(s.tokenHidden, ids))
 }
@@ -1483,6 +1538,12 @@ func (s *Session) stepOwned(id int) []float32 {
 }
 
 func (s *Session) stepOwnedMode(id int, greedy bool) ([]float32, int) {
+	return s.stepOwnedOutput(id, greedy, nil)
+}
+
+// output is consumed only by the ordinary fully backend-resident HAL branch.
+// Architecture-specific paths preserve their existing full-logit behavior.
+func (s *Session) stepOwnedOutput(id int, greedy bool, output func(int, int) ([]float32, int)) ([]float32, int) {
 	s.releaseGreedyLogits()
 	if err := s.refuseUnimplementedV4FlashAttention(); err != nil {
 		panic(err)
@@ -1521,6 +1582,9 @@ func (s *Session) stepOwnedMode(id int, greedy bool) ([]float32, int) {
 	}
 	if s.Backend != nil {
 		s.ensureOpenBackendSession()
+		if output != nil {
+			return output(id, s.halKV.Len())
+		}
 		if greedy && s.activeTap() == nil {
 			return s.tokenGreedy(id, s.halKV.Len())
 		}

@@ -59,6 +59,7 @@ type reqResult struct {
 	streamed          bool            // completed via an SSE stream (vs plain-JSON fallback)
 	ttft              time.Duration   // start to first non-empty content chunk; 0 if none arrived
 	chunkIntervals    []time.Duration // client inter-content-chunk arrival deltas; not token timings
+	firstChunkTokens  *int            // usage.completion_tokens reported on the first content chunk (per-chunk usage); nil when not reported
 }
 
 // sseChunk is one `data:` payload of an OpenAI-compatible streaming
@@ -85,9 +86,24 @@ type sseMeasure struct {
 	nContent       int
 	usageTokens    int
 	usageKnown     bool
-	sawData        bool
-	streamErr      error
-	done           bool
+	// firstChunkTokens is usage.completion_tokens reported on the chunk that set
+	// firstContent (per-chunk usage); nil when the first content chunk carried no
+	// usage or no content chunk arrived.
+	firstChunkTokens *int
+	sawData          bool
+	streamErr        error
+	done             bool
+}
+
+// feedSSEMessage folds one complete SSE event body (possibly several physical
+// lines) into m at arrival time now, keeping the per-line contract of
+// feedSSELine for each line: non-data lines and malformed payloads are skipped,
+// never fatal; a `data: [DONE]` terminal marks the stream complete. All lines
+// of one event share the event's chunk-arrival stamp.
+func (m *sseMeasure) feedSSEMessage(body string, now time.Time) {
+	for _, line := range strings.Split(body, "\n") {
+		m.feedSSELine(line, now)
+	}
 }
 
 // feedSSELine folds one SSE line into m at arrival time now. Non-data lines
@@ -125,6 +141,12 @@ func (m *sseMeasure) feedSSELine(line string, now time.Time) {
 		}
 		if m.firstContent.IsZero() {
 			m.firstContent = now
+			// Per-chunk usage on the first content chunk feeds the aiperf-style ITL
+			// divisor; explicit 0 is captured too (DecodeTokenDivisor's non-positive
+			// rule handles it).
+			if n := chunk.Usage.CompletionTokens; n != nil && *n >= 0 {
+				m.firstChunkTokens = n
+			}
 		} else {
 			m.chunkIntervals = append(m.chunkIntervals, now.Sub(m.lastContent))
 		}
@@ -189,6 +211,15 @@ type PointResult struct {
 	ContentChunks                int     `json:"content_chunks,omitempty"`
 	MeanInterContentChunkMS      float64 `json:"mean_inter_content_chunk_ms,omitempty"`
 	ContentChunkCadencePerSecond float64 `json:"content_chunk_cadence_per_second,omitempty"` // reciprocal mean interval, not aggregate throughput
+	// aiperf-style inter-token latency, derived from the decode window (request
+	// latency - TTFT) and server-reported usage; NOT the client chunk-cadence
+	// metric above. Populated only from streamed successes with usable usage.
+	MeanITLMS float64 `json:"mean_itl_ms,omitempty"`
+	ITLP50MS  float64 `json:"itl_p50_ms,omitempty"`
+	ITLP95MS  float64 `json:"itl_p95_ms,omitempty"`
+	// PerChunkUsageDivisorRequests counts requests whose ITL divisor came from
+	// server per-chunk usage rather than the osl-1 fallback.
+	PerChunkUsageDivisorRequests int `json:"per_chunk_usage_divisor_requests,omitempty"`
 	// Deprecated: SSE content chunks do not establish token boundaries. These
 	// legacy fields remain zero/omitted; use the explicitly named chunk metrics.
 	TPOTMS                float64 `json:"tpot_ms,omitempty"`
@@ -217,11 +248,25 @@ type Config struct {
 	APIKey        string
 	HTTPClient    *http.Client
 	Now           func() time.Time
+	// Dataset optionally replays stored payload bytes verbatim instead of the
+	// synthetic prompt: request i sends payloadSeq(Dataset)[i%n]. The client is
+	// owned by the caller; loadgen never closes it.
+	Dataset *DatasetClient
+	// RatePerSec paces job issuance at this absolute-deadline request rate per
+	// concurrency point; 0 disables pacing (issue as fast as workers consume).
+	RatePerSec float64
+	// MaxCatchUp bounds how far behind schedule the pacer may fall before it
+	// re-anchors to now; 0 selects defaultMaxCatchUp, negative is rejected by
+	// validateConfig.
+	MaxCatchUp time.Duration
 }
 
 var (
 	errNonPositiveConcurrency   = errors.New("loadgen: concurrency must be positive")
 	errRequestsBelowConcurrency = errors.New("loadgen: requests-per must be at least maximum concurrency")
+	errNonFiniteRate            = errors.New("loadgen: rate-per-second must be finite")
+	errNegativeRate             = errors.New("loadgen: rate-per-second must be non-negative")
+	errNegativeMaxCatchUp       = errors.New("loadgen: max-catch-up must be non-negative")
 )
 
 // validateConfig rejects sweep shapes that cannot actually put every requested
@@ -239,7 +284,103 @@ func validateConfig(cfg *Config) error {
 	if cfg.RequestsPer < maxConcurrency {
 		return fmt.Errorf("%w: requests-per=%d maximum-concurrency=%d", errRequestsBelowConcurrency, cfg.RequestsPer, maxConcurrency)
 	}
+	if math.IsNaN(cfg.RatePerSec) || math.IsInf(cfg.RatePerSec, 0) {
+		return fmt.Errorf("%w: got %g", errNonFiniteRate, cfg.RatePerSec)
+	}
+	if cfg.RatePerSec < 0 {
+		return fmt.Errorf("%w: got %g", errNegativeRate, cfg.RatePerSec)
+	}
+	if cfg.MaxCatchUp < 0 {
+		return fmt.Errorf("%w: got %s", errNegativeMaxCatchUp, cfg.MaxCatchUp)
+	}
 	return nil
+}
+
+// defaultMaxCatchUp bounds how far behind its absolute deadline schedule a paced
+// feed may fall before it re-anchors to "now". Upstream aiperf defaults its
+// MAX_CATCHUP_SECONDS to 0.01 (request_rate.py / environment.py at the pinned
+// commit); zero MaxCatchUp selects this value instead of disabling pacing.
+const defaultMaxCatchUp = 10 * time.Millisecond
+
+// pacer paces n issues against absolute deadlines with a bounded catch-up
+// window, porting aiperf's constant-rate loop mechanics (ai-dynamo/aiperf,
+// src/aiperf/timing/strategies/request_rate.py:234
+// @ ab610add4e8876fca223197596c728e17365f381, Apache-2.0):
+//
+//   - the schedule tracks cumulative absolute targets, so oversleeps never
+//     compound into drift;
+//   - it re-anchors to "now" only once the backlog exceeds maxCatchUp, so
+//     sub-window timer jitter keeps the original schedule while a genuine stall
+//     drops its missed ticks instead of firing a burst;
+//   - the next target advances BEFORE issuing, so variable issue latency cannot
+//     shift subsequent deadlines.
+//
+// The upstream asyncio high-resolution wait became a context-raced timer
+// (pacerSleep); issuance is reported through issue() so the caller owns the
+// worker channel.
+type pacer struct {
+	interval   time.Duration
+	maxCatchUp time.Duration
+	now        func() time.Time
+	sleep      func(context.Context, time.Duration) bool
+}
+
+func newPacer(interval, maxCatchUp time.Duration, now func() time.Time, sleep func(context.Context, time.Duration) bool) *pacer {
+	if now == nil {
+		now = time.Now
+	}
+	if sleep == nil {
+		sleep = pacerSleep
+	}
+	return &pacer{interval: interval, maxCatchUp: maxCatchUp, now: now, sleep: sleep}
+}
+
+// pacerSleep blocks until d elapses or ctx finishes; false means the context
+// ended first.
+func pacerSleep(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// run issues up to n calls through issue (each returning whether it was
+// accepted) on an absolute-deadline schedule: the first deadline is one
+// interval after start, each subsequent deadline advances by the interval from
+// the PREVIOUS deadline (never from wall-clock wake time, so oversleeps do not
+// compound). If the next deadline has fallen more than maxCatchUp in the past,
+// the schedule re-anchors to now — missed ticks are dropped, never burst-caught.
+// It stops early when ctx finishes or issue rejects, and returns how many
+// issues were actually accepted: a rejected feed is never counted, so callers
+// can slice their result arrays to the returned count safely. The deadline
+// advances BEFORE issuing so issue latency cannot shift subsequent deadlines.
+func (p *pacer) run(ctx context.Context, n int, issue func() bool) int {
+	next := p.now().Add(p.interval)
+	issued := 0
+	for i := 0; i < n; i++ {
+		if ctx.Err() != nil {
+			break
+		}
+		now := p.now()
+		if next.Add(p.maxCatchUp).Before(now) {
+			next = now // past the catch-up window: drop the backlog, keep the rate
+		}
+		if next.After(now) {
+			if !p.sleep(ctx, next.Sub(now)) {
+				break
+			}
+		}
+		next = next.Add(p.interval) // advance before issue: issue latency must not compound
+		if !issue() {
+			break // rejected feed: not counted, nothing downstream consumed it
+		}
+		issued++
+	}
+	return issued
 }
 
 func (c *Config) client() *http.Client {
@@ -257,17 +398,24 @@ func (c *Config) now() time.Time {
 }
 
 // oneRequest issues a single chat completion as a stream (stream:true) and measures
-// wall-clock, time-to-first-content, and inter-content-chunk arrivals. If the endpoint
-// answers with a plain JSON body instead of an SSE stream, it falls back to the
-// non-streaming shape (streamed=false, no phase timing).
-func oneRequest(ctx context.Context, cfg *Config, inFlight *clientInFlight) reqResult {
-	body, _ := json.Marshal(chatRequest{
-		Model:       cfg.Model,
-		Messages:    []chatMessage{{Role: "user", Content: cfg.Prompt}},
-		MaxTokens:   cfg.MaxTokens,
-		Temperature: 0,
-		Stream:      true,
-	})
+// wall-clock, time-to-first-content, and inter-content-chunk arrivals. When
+// bodyOverride is non-nil it is sent verbatim (stored-payload replay); otherwise
+// the synthetic chat request is built from cfg. If the endpoint answers with a
+// plain JSON body instead of an SSE stream, it falls back to the non-streaming
+// shape (streamed=false, no phase timing).
+func oneRequest(ctx context.Context, cfg *Config, inFlight *clientInFlight, bodyOverride []byte) reqResult {
+	var body []byte
+	if bodyOverride != nil {
+		body = bodyOverride
+	} else {
+		body, _ = json.Marshal(chatRequest{
+			Model:       cfg.Model,
+			Messages:    []chatMessage{{Role: "user", Content: cfg.Prompt}},
+			MaxTokens:   cfg.MaxTokens,
+			Temperature: 0,
+			Stream:      true,
+		})
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.URL, bytes.NewReader(body))
 	if err != nil {
 		return reqResult{err: err}
@@ -309,22 +457,37 @@ func oneRequest(ctx context.Context, cfg *Config, inFlight *clientInFlight) reqR
 var emptyStreamBody = errors.New("empty stream body")
 
 // measureStream consumes an SSE chat-completions body, sampling the arrival time of
-// each content chunk. A clean EOF (with or without [DONE]) completes the request;
-// malformed lines are skipped and never panic. Observed non-EOF read errors fail
-// the request, including errors accompanying partial data. Completion tokens come
-// only from usage.completion_tokens; chunk counts remain a separate observation.
+// each content chunk. The body is parsed incrementally as complete SSE events:
+// event delimiters that straddle two network chunks are recovered by re-scanning
+// the overlap region, and every event is stamped with the arrival time of the
+// chunk that completed it. A clean EOF (with or without [DONE]) completes the
+// request; malformed lines are skipped and never panic. Observed non-EOF read
+// errors fail the request, including errors accompanying partial data.
+// Completion tokens come only from usage.completion_tokens; chunk counts remain
+// a separate observation.
 func measureStream(cfg *Config, br *bufio.Reader, firstLine string, firstErr error, start time.Time) reqResult {
 	var m sseMeasure
+	p := newSSEStreamParser()
 	if firstLine != "" {
-		m.feedSSELine(firstLine, cfg.now())
+		for _, msg := range p.feed([]byte(firstLine), cfg.now()) {
+			m.feedSSEMessage(msg.body, msg.at)
+		}
 	}
+	chunkBuf := make([]byte, 32*1024)
 	readErr := firstErr
 	for readErr == nil && !m.done {
-		line, err := br.ReadString('\n')
-		if line != "" {
-			m.feedSSELine(line, cfg.now())
+		n, err := br.Read(chunkBuf)
+		if n > 0 {
+			for _, msg := range p.feed(chunkBuf[:n], cfg.now()) {
+				m.feedSSEMessage(msg.body, msg.at)
+			}
 		}
 		readErr = err
+	}
+	if errors.Is(readErr, io.EOF) {
+		for _, msg := range p.finish(cfg.now()) {
+			m.feedSSEMessage(msg.body, msg.at)
+		}
 	}
 	lat := cfg.now().Sub(start)
 	if readErr != nil && !errors.Is(readErr, io.EOF) {
@@ -342,6 +505,7 @@ func measureStream(cfg *Config, br *bufio.Reader, firstLine string, firstErr err
 		rr.ttft = m.firstContent.Sub(start)
 	}
 	rr.chunkIntervals = m.chunkIntervals
+	rr.firstChunkTokens = m.firstChunkTokens
 	return rr
 }
 
@@ -367,29 +531,102 @@ func jsonFallback(cfg *Config, br *bufio.Reader, firstLine string, firstErr erro
 	return reqResult{latency: cfg.now().Sub(start), completionTokens: cr.Usage.CompletionTokens}
 }
 
-// runPoint runs `requests` total requests at the given concurrency.
+// errNoPayloads is reported per request when a dataset-backed sweep has no
+// payload bytes to replay.
+var errNoPayloads = errors.New("loadgen: dataset contains no payload bytes")
+
+// payloadSeq flattens a dataset's (session, turn) pairs, in index order, into
+// the ordered replay sequence a sweep round-robins over.
+func payloadSeq(ds *DatasetClient) ([][]byte, error) {
+	idx := ds.Index()
+	var seq [][]byte
+	for _, sid := range idx.ConversationIDs {
+		for turn := range idx.PayloadOffsets[sid] {
+			b, err := ds.PayloadBytes(sid, turn)
+			if err != nil {
+				return nil, err
+			}
+			seq = append(seq, b)
+		}
+	}
+	return seq, nil
+}
+
+// runPoint issues up to `requests` requests at the given concurrency. When
+// cfg.Dataset is set, request i replays payloadSeq(cfg.Dataset)[i%n] verbatim;
+// otherwise the synthetic prompt from cfg is used. With RatePerSec > 0,
+// issuance is paced on absolute deadlines with a bounded catch-up window
+// (pacer); otherwise jobs issue as fast as workers consume. Feeding stops when
+// ctx finishes in both modes, and PointResult.Requests reports the count
+// actually issued. With pacing enabled, PointResult.WallSeconds spans the
+// paced schedule, so it includes pacing idle time and throughput denominators
+// include pacing gaps.
 func runPoint(ctx context.Context, cfg *Config, concurrency, requests int) PointResult {
 	results := make([]reqResult, requests)
 	jobs := make(chan int)
 	inFlight := &clientInFlight{}
 	var wg sync.WaitGroup
 	wallStart := cfg.now()
+	var (
+		bodies [][]byte
+		dsErr  error
+	)
+	if cfg.Dataset != nil {
+		bodies, dsErr = payloadSeq(cfg.Dataset)
+	}
 	for w := 0; w < concurrency; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				results[i] = oneRequest(ctx, cfg, inFlight)
+				if dsErr != nil {
+					results[i] = reqResult{err: dsErr}
+					continue
+				}
+				var override []byte
+				if len(bodies) > 0 {
+					override = bodies[i%len(bodies)]
+				} else if cfg.Dataset != nil {
+					results[i] = reqResult{err: errNoPayloads}
+					continue
+				}
+				results[i] = oneRequest(ctx, cfg, inFlight, override)
 			}
 		}()
 	}
-	for i := 0; i < requests; i++ {
-		jobs <- i
+	feedJob := func(i int) bool {
+		select {
+		case jobs <- i:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	var issued int
+	if cfg.RatePerSec > 0 {
+		interval := time.Duration(float64(time.Second) / cfg.RatePerSec)
+		catchUp := cfg.MaxCatchUp
+		if catchUp <= 0 {
+			catchUp = defaultMaxCatchUp
+		}
+		counter := 0
+		issued = newPacer(interval, catchUp, cfg.now, nil).run(ctx, requests, func() bool {
+			i := counter
+			counter++
+			return feedJob(i)
+		})
+	} else {
+		for i := 0; i < requests; i++ {
+			if !feedJob(i) {
+				break
+			}
+			issued++
+		}
 	}
 	close(jobs)
 	wg.Wait()
 	wall := cfg.now().Sub(wallStart)
-	result := aggregate(concurrency, requests, wall, results)
+	result := aggregate(concurrency, issued, wall, results[:issued])
 	result.PeakInFlight = inFlight.peakValue()
 	return result
 }
@@ -402,6 +639,9 @@ func aggregate(concurrency, requests int, wall time.Duration, results []reqResul
 	var ttfts []float64
 	var chunkIntervalSum float64
 	var chunkIntervalN int
+	var itls []float64
+	var itlSum float64
+	var perChunkDivisorRequests int
 	for _, r := range results {
 		if r.err != nil {
 			pr.Errors++
@@ -427,6 +667,18 @@ func aggregate(concurrency, requests int, wall time.Duration, results []reqResul
 			chunkIntervalSum += float64(d.Nanoseconds()) / 1e6
 			chunkIntervalN++
 		}
+		// aiperf-style ITL: decode window over the per-chunk-aware decode-token
+		// divisor. Skips requests without usable usage or a measured TTFT.
+		if !r.tokenUsageMissing && r.completionTokens >= 2 && r.ttft > 0 {
+			if d, ok := DecodeTokenDivisor(r.completionTokens, r.firstChunkTokens); ok {
+				itl := ITLMS(r.latency, r.ttft, d)
+				itls = append(itls, itl)
+				itlSum += itl
+				if d.PerChunk {
+					perChunkDivisorRequests++
+				}
+			}
+		}
 	}
 	if requests > 0 {
 		pr.ErrorRate = float64(pr.Errors) / float64(requests)
@@ -451,6 +703,13 @@ func aggregate(concurrency, requests int, wall time.Duration, results []reqResul
 			pr.ContentChunkCadencePerSecond = 1000 / pr.MeanInterContentChunkMS
 		}
 	}
+	if n := len(itls); n > 0 {
+		sort.Float64s(itls)
+		pr.MeanITLMS = itlSum / float64(n)
+		pr.ITLP50MS = percentile(itls, 50)
+		pr.ITLP95MS = percentile(itls, 95)
+	}
+	pr.PerChunkUsageDivisorRequests = perChunkDivisorRequests
 	return pr
 }
 

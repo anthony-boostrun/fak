@@ -135,10 +135,18 @@ func AcceptPreparedLand(root, wtPath string, expected PreparedLandExpectation, g
 	if _, refusal := landSourceSnapshot(root, cfg, git); refusal != nil {
 		return *refusal
 	}
-	if receipt.PathsDigest != digestStrings(expectedPaths) ||
-		receipt.VerifyCommandDigest != digestStrings([]string{expectedBinding.Command}) ||
-		receipt.TagsDigest != digestStrings(expectedBinding.Tags) {
-		return preparedMismatch("prepared landing expectations do not match receipt", "")
+	var mismatches []string
+	if receipt.PathsDigest != digestStrings(expectedPaths) {
+		mismatches = append(mismatches, "paths")
+	}
+	if receipt.VerifyCommandDigest != digestStrings([]string{expectedBinding.Command}) {
+		mismatches = append(mismatches, "verification_command")
+	}
+	if receipt.TagsDigest != digestStrings(expectedBinding.Tags) {
+		mismatches = append(mismatches, "tags")
+	}
+	if len(mismatches) > 0 {
+		return preparedMismatch("prepared landing expectations do not match receipt", strings.Join(mismatches, ","))
 	}
 	receiptPaths, err := normalizePreparedPaths(receipt.Paths)
 	if err != nil || len(receiptPaths) == 0 || digestStrings(receiptPaths) != receipt.PathsDigest {
@@ -240,7 +248,12 @@ func revalidatePreparedLandWithRootState(root, wtPath string, receipt PreparedLa
 	if rc != 0 || strings.TrimSpace(parent) != receipt.ParentSHA {
 		return preparedMismatch("prepared candidate parent mismatch", tail(parent, 200))
 	}
-	rc, names := run(git, root, []string{"diff", "--name-only", "-z", receipt.ParentSHA, receipt.CandidateSHA})
+	// The name list must enumerate the SAME path sides prepare recorded:
+	// expandLandPaths builds CandidatePaths with --no-ext-diff --no-renames, so a
+	// rename lands as two entries (source deletion + destination addition). Git's
+	// default rename detection would collapse each pair to its destination only,
+	// making every rename-bearing candidate fail this digest check.
+	rc, names := run(git, root, []string{"diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", receipt.ParentSHA, receipt.CandidateSHA})
 	if rc != 0 {
 		return preparedMismatch("could not read prepared candidate paths", tail(names, 200))
 	}

@@ -198,8 +198,8 @@ func TestCUDACompensatedScratchFailureOwnership(t *testing.T) {
 		}
 	}
 	if loan {
-		sequence := read("cuda_qwen35_sequence.go")
-		allRows := between(sequence, "\tif req.NeedAllLogits {", "\n\tc.releaseTransientBuffers([]*cudaBuf{xBuf, finalPanelBuf})")
+		sequence := function(read("cuda_qwen35_sequence.go"), "func (c *cudaBackend) Qwen35SequencePrefill(")
+		allRows := function(sequence, "\tif req.NeedAllLogits {")
 		end := strings.Index(allRows, "if splitErr := finishSplit(); splitErr != nil {")
 		head := strings.Index(allRows, "logitsRows, logitsRowsBuf, err = c.qwen35SequenceMatMulLocked(req.Output, finalPanel, tokens, \"output-all-head\")")
 		if end < 0 || head <= end {
@@ -217,11 +217,22 @@ func TestCUDACompensatedScratchFailureOwnership(t *testing.T) {
 				t.Fatalf("early layer-loan retirement failure handler missing %q", want)
 			}
 		}
+		// The raw-hidden panel is the final residual owner. Only the
+		// unrequested branch may release it before the final output fence.
+		release := between(sequence, "\tif rawHiddenBuf == nil {", "\n\tvar logits Tensor")
+		unrequested := function(release, "if rawHiddenBuf == nil {")
+		requested := between(release, "} else {", "\n\t}")
+		if strings.Count(release, "c.releaseTransientBuffers(") != 2 ||
+			!strings.Contains(unrequested, "c.releaseTransientBuffers([]*cudaBuf{xBuf, finalPanelBuf})") ||
+			!strings.Contains(requested, "c.releaseTransientBuffers([]*cudaBuf{finalPanelBuf})") ||
+			strings.Contains(requested, "xBuf") || strings.Contains(requested, "rawHiddenBuf") {
+			t.Fatal("early release must retain requested raw-hidden rows and preserve unrequested owner order")
+		}
 		for _, want := range []string{
 			"if splitToken != 0 {\n\t\tfinalFenceErr = finishSplit()\n\t} else {\n\t\tfinalFenceErr = c.qwen35SequenceSyncLocked()\n\t}",
 			"atomic.StoreUint32(&logitsRowsBuf.invalid, 1)",
 			"LogitsRows: logitsRows",
-			"c.qwen35SequenceReleaseSinceLocked(transientStart, lastBuf, logitsBuf, logitsRowsBuf)",
+			"c.qwen35SequenceReleaseSinceLocked(transientStart, lastBuf, logitsBuf, logitsRowsBuf, rawHiddenBuf)",
 		} {
 			if !strings.Contains(sequence, want) {
 				t.Fatalf("all-row output fence/publication contract missing %q", want)
@@ -391,6 +402,53 @@ static bool private_ledger_matches() {
 int main() {
   using Route=int (*)(int,int,int);
   const Route routes[]={route0, route1, route2, route3, route4, route5};
+#ifdef TEST_SEQUENCE_LOAN
+  // GDN owns ordinary transient buffers even when no split loan is active.
+  // Exercise the real fence/drain/final-fence and allocator-free blocks: an
+  // unsuccessful completion must retain these owners, not just private loans.
+  for (int site=0; site<3; ++site) {
+    reset_context();
+    void *owner=fcuda_malloc(1024);
+    CHECK(owner && g_live.size()==1);
+    ++pending_reads;
+    sync_fail_at=1;
+    if (site==0) CHECK(qwen35_gdn_fence()==700);
+    if (site==1) CHECK(qwen35_gdn_drain_after_error(20001)==70700);
+    if (site==2) CHECK(gdn_final_fence()==70700);
+    fcuda_free(owner);
+    CHECK(g_live.count(owner)==1 && pooled()==0 && free_attempts==0);
+    CHECK(g_cuda_cleanup_status==700 && v41_candidates_stream_uncertain());
+    CHECK(sync_calls==1 && pending_reads==1 && physical.count(owner)==1);
+    // A later successful fence cannot rehabilitate the retained storage.
+    sync_fail_at=0;
+    CHECK(qwen35_gdn_fence()==0 && gdn_final_fence()==0);
+    fcuda_free(owner);
+    CHECK(g_cuda_cleanup_status==700 && g_live.count(owner)==1 && pooled()==0);
+  }
+  for (int site=0; site<2; ++site) {
+    reset_context();
+    void *owner=fcuda_malloc(1024);
+    CHECK(owner);
+    g_cuda_cleanup_status=701; // an earlier family already quarantined the stream
+    sync_fail_at=1;
+    if (site==0) CHECK(qwen35_gdn_fence()==700);
+    if (site==1) CHECK(gdn_final_fence()==70700);
+    fcuda_free(owner);
+    CHECK(g_cuda_cleanup_status==701 && g_live.count(owner)==1 && pooled()==0);
+  }
+  // Capture remains a no-sync success; a genuine successful drain keeps the
+  // original launch error and still allows ordinary pool retirement.
+  reset_context();
+  void *owner=fcuda_malloc(1024);
+  CHECK(owner);
+  ++pending_reads; g_capture_open=true;
+  CHECK(qwen35_gdn_fence()==0 && sync_calls==0 && pending_reads==1);
+  CHECK(g_cuda_cleanup_status==0 && !v41_candidates_stream_uncertain());
+  g_capture_open=false;
+  CHECK(qwen35_gdn_drain_after_error(20001)==20001 && sync_calls==1 && pending_reads==0);
+  fcuda_free(owner);
+  CHECK(g_cuda_cleanup_status==0 && g_live.empty() && pooled()==1);
+#endif
   // The shared allocator consumes a real capacity miss exactly once, while
   // leaving a non-OOM execution fault pending for the next status reader.
   reset_context(); alloc_fail_at=1;
@@ -688,7 +746,8 @@ int main() {
     if (site==1) CHECK(qwen35_gdn_drain_after_error(20001)==70700);
     if (site==2) CHECK(gdn_final_fence()==70700);
     if (site==3) CHECK(fak_qwen35_sequence_sync()==60700);
-    CHECK(fcuda_sequence_split_end(token,&status)==700 && status.phase==FCUDA_SEQUENCE_SPLIT_FENCE);
+    const int phase=(site==1 || site==2) ? FCUDA_SEQUENCE_SPLIT_QUARANTINE : FCUDA_SEQUENCE_SPLIT_FENCE;
+    CHECK(fcuda_sequence_split_end(token,&status)==700 && status.phase==phase);
     CHECK(sync_calls==1 && free_attempts==0 && g_live.size()==4 && physical.size()==4 && pooled()==0);
     CHECK(private_ledger_matches());
     CHECK(route0(4096,512,128)==-1 && attempts==4 && launches==1);

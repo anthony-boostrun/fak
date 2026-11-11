@@ -18,9 +18,10 @@ import (
 // output groups) run the rowtile panel GEMM, out-of-contract alignment/block shapes stay on
 // the plain per-row BitExact GEMM, and only an argument-bounds refusal (P > 65535 or an int
 // overflow guard) falls back to the retired dequant arm. TestQ8PanelPrefillRoute proves the
-// decision on any host (source contract + compiled production slice); TestGDNProjectionParity
-// pins the numerics of the new lane against the f32 reference on device, fail-closed without
-// one.
+// decision on any host (source contract + compiled production slice), including the GDN
+// sequence-spine caller qwen35_gdn_q8_prefill - the live serve path's production gate for the
+// measured GDN/attn-qk leaf (wire-q8-panel-prefill-route); TestGDNProjectionParity pins the
+// numerics of the new lane against the f32 reference on device, fail-closed without one.
 
 // gdnPrefillShapes mirrors the Qwen3.8 hybrid projection geometry the retired arm served at
 // P>=128: GDN in/out projections (nK=16, nV=48, kHd=vHd=128, hidden=5120) and the full-attention
@@ -61,6 +62,35 @@ func q8PrefillLane(out, in, p, block int, aligned16 bool) string {
 	return "rowtile"
 }
 
+// gdnSpinePrefillBody extracts the complete qwen35_gdn_q8_prefill definition from the GDN
+// sequence spine: the live serve path's production gate for eligible P>=128 Q8_0 GDN panels,
+// whose selected arm this file pins as a closed contract.
+func gdnSpinePrefillBody(t *testing.T, src string) string {
+	t.Helper()
+	start := strings.Index(src, "static int qwen35_gdn_q8_prefill(")
+	if start < 0 {
+		t.Fatal("qwen35_gdn_q8_prefill missing from cuda/qwen35_gdn.cuh")
+	}
+	open := start + strings.Index(src[start:], "{")
+	if open <= start {
+		t.Fatal("qwen35_gdn_q8_prefill signature unterminated")
+	}
+	depth := 0
+	for i := open; i < len(src); i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return src[start : i+1]
+			}
+		}
+	}
+	t.Fatal("qwen35_gdn_q8_prefill body incomplete")
+	return ""
+}
+
 // TestQ8PanelPrefillRoute pins the closed routing contract for P>=128 Q8_0 prefill: which arm
 // serves the GDN in/out projections and the full-attention q/k projections, and which shapes
 // fall back where. Every assertion runs on any host; the compiled witness dominates the cost
@@ -92,6 +122,20 @@ func TestQ8PanelPrefillRoute(t *testing.T) {
 		}
 		if strings.Contains(body, "if (P >= 128) return q8_dequant_sgemm(") {
 			t.Fatal("direct P>=128 dequant branch resurrected")
+		}
+	})
+
+	t.Run("gdn-sequence-spine-delegates-to-routed-entry", func(t *testing.T) {
+		b, err := os.ReadFile(filepath.Join("cuda", "qwen35_gdn.cuh"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := gdnSpinePrefillBody(t, string(b))
+		if !strings.Contains(body, "fcuda_q8_matmul_f32(") {
+			t.Fatal("GDN sequence spine lost its delegation to the routed Q8 entry")
+		}
+		if strings.Contains(body, "q8_dequant_sgemm(") {
+			t.Fatal("GDN sequence spine still serves the retired dequant arm directly")
 		}
 	})
 
@@ -169,8 +213,9 @@ func TestQ8PanelPrefillRoute(t *testing.T) {
 			}
 			constants += quant[begin:begin+last+1] + "\n"
 		}
+		spine := gdnSpinePrefillBody(t, read(filepath.Join("cuda", "qwen35_gdn.cuh")))
 		program := strings.TrimPrefix(read(filepath.Join("cuda", "alloc_ledger.h")), "#pragma once\n") + "\n" +
-			q8RouteHarness + "\n" + constants + quant[start:end] + "\n" + q8RouteMain
+			q8RouteHarness + "\n" + constants + quant[start:end] + "\n" + spine + "\n" + q8RouteMain
 		dir := t.TempDir()
 		source, binary := filepath.Join(dir, "route.cpp"), filepath.Join(dir, "route")
 		if err := os.WriteFile(source, []byte(program), 0600); err != nil {
@@ -191,6 +236,20 @@ func TestQ8PanelPrefillRoute(t *testing.T) {
 			"block16":         "k_q8_quant_act k_q8_gemm",
 			"decode-lane":     "k_q8_quant_act k_q8_gemm",
 			"out-of-contract": "q8_dequant_sgemm",
+			// Production GDN sequence-spine caller over the Qwen3.8-27B geometry: convDim x hidden
+			// in-proj at the measured P=128 cold-prefill panel, hidden x valueDim out-proj, and the
+			// argument-bounds refusal that keeps the retired dequant arm reachable as last resort.
+			"gdn-in-proj":  "k_q8_quant_act k_q8_gemm_rowtile",
+			"gdn-out-proj": "k_q8_quant_act k_q8_gemm_rowtile",
+			"gdn-fallback": "q8_dequant_sgemm",
+			// Immediate errors are positive CUDA statuses, never argument refusals:
+			// failed quantization must not submit a dependent GEMM or legacy fallback.
+			"quant-rowtile-error": "k_q8_quant_act",
+			"quant-perrow-error":  "k_q8_quant_act",
+			"gemm-rowtile-error":  "k_q8_quant_act k_q8_gemm_rowtile",
+			"gemm-perrow-error":   "k_q8_quant_act k_q8_gemm",
+			"gdn-quant-error":     "k_q8_quant_act",
+			"gdn-gemm-error":      "k_q8_quant_act k_q8_gemm_rowtile",
 		}
 		for scenario, seq := range want {
 			t.Run(scenario, func(t *testing.T) {
@@ -221,12 +280,24 @@ using cudaError_t = int;
 static constexpr int cudaSuccess = 0, cudaErrorMemoryAllocation = 2;
 #define FCUDA_SCRATCH_ALLOC_FAILED 80001
 static std::vector<std::string> launched;
+static const char *fail_kernel = "";
+static cudaError_t launch_error = cudaSuccess;
+static constexpr cudaError_t injected_error = 719;
+static inline cudaError_t cudaGetLastError() {
+  const cudaError_t status = launch_error;
+  launch_error = cudaSuccess;
+  return status;
+}
+static void record_launch(const char *name) {
+  launched.push_back(name);
+  if (std::strcmp(name, fail_kernel) == 0) launch_error = injected_error;
+}
 template<class T> static cudaError_t cudaMalloc(T **out, size_t bytes) {
   *out = static_cast<T *>(std::malloc(bytes));
   return *out ? cudaSuccess : cudaErrorMemoryAllocation;
 }
 static cudaError_t cudaFree(void *) { return cudaSuccess; }
-#define FCUDA_TS(name, grid, ...) launched.push_back(name)
+#define FCUDA_TS(name, grid, ...) record_launch(name)
 // The production translation unit gets this declaration from cuda_backend.h; the host slice
 // does not include the header, so carry the flat ABI prototype here.
 extern "C" int fcuda_q8_matmul_rows_f32(const int8_t *, const float *, const float *, float *,
@@ -239,10 +310,12 @@ static int q8_dequant_sgemm(const int8_t *, const float *, const float *, float 
 
 // q8RouteMain drives the production entry point through the five routing cases: the in-contract
 // P>=128 panel (rowtile), the misaligned and block-16 fallbacks (per-row), the unchanged P<128
-// decode lane, and the P>65535 argument-bounds refusal (legacy dequant fallback).
+// decode lane, and the P>65535 argument-bounds refusal (legacy dequant fallback). The gdn-*
+// cases drive the extracted production GDN sequence-spine caller over the Qwen3.8-27B geometry.
 const q8RouteMain = `
-static int scenario(int p, int block, int misalign) {
+static int scenario(int p, int block, int misalign, const char *failure = "") {
   launched.clear();
+  fail_kernel = failure;
   alignas(16) static int8_t codes[256] = {};
   static float scale[256] = {};
   const int out = 8, in = 256;
@@ -253,8 +326,35 @@ static int scenario(int p, int block, int misalign) {
   const int rc = fcuda_q8_matmul_f32(c, scale, x, y, out, in, p, block);
   delete[] x;
   delete[] y;
-  if (rc != 0) {
-    std::fprintf(stderr, "rc=%d\n", rc);
+  const int expected = *failure ? injected_error : 0;
+  if (rc != expected) {
+    std::fprintf(stderr, "rc=%d want=%d\n", rc, expected);
+    return 1;
+  }
+  for (size_t i = 0; i < launched.size(); ++i)
+    std::fprintf(stdout, "%s%s", i ? " " : "", launched[i].c_str());
+  std::fprintf(stdout, "\n");
+  return 0;
+}
+static int spineScenario(int out, int in, int p, int block, const char *failure = "") {
+  launched.clear();
+  fail_kernel = failure;
+  alignas(16) static int8_t codes[256] = {};
+  static float scale[256] = {};
+  // The argument-bounds refusal reads no operand, so only in-bounds panels allocate; the
+  // out-of-contract case costs nothing and still proves the last-resort arm stays reachable.
+  float *x = nullptr, *y = nullptr;
+  if (p <= 65535 && p <= INT_MAX / in) {
+    x = new float[(size_t)p * in];
+    y = new float[(size_t)p * out];
+    for (int i = 0; i < p * in; ++i) x[i] = 0.5f;
+  }
+  const int rc = qwen35_gdn_q8_prefill(codes, scale, x, y, out, in, p, block);
+  delete[] x;
+  delete[] y;
+  const int expected = *failure ? injected_error : 0;
+  if (rc != expected) {
+    std::fprintf(stderr, "rc=%d want=%d\n", rc, expected);
     return 1;
   }
   for (size_t i = 0; i < launched.size(); ++i)
@@ -270,6 +370,15 @@ int main(int argc, char **argv) {
   if (!std::strcmp(s, "block16")) return scenario(200, 16, 0);
   if (!std::strcmp(s, "decode-lane")) return scenario(64, 32, 0);
   if (!std::strcmp(s, "out-of-contract")) return scenario(70000, 32, 0);
+  if (!std::strcmp(s, "gdn-in-proj")) return spineScenario(10240, 5120, 128, 32);
+  if (!std::strcmp(s, "gdn-out-proj")) return spineScenario(5120, 6144, 512, 32);
+  if (!std::strcmp(s, "gdn-fallback")) return spineScenario(10240, 5120, 70000, 32);
+  if (!std::strcmp(s, "quant-rowtile-error")) return scenario(200, 32, 0, "k_q8_quant_act");
+  if (!std::strcmp(s, "quant-perrow-error")) return scenario(64, 32, 0, "k_q8_quant_act");
+  if (!std::strcmp(s, "gemm-rowtile-error")) return scenario(200, 32, 0, "k_q8_gemm_rowtile");
+  if (!std::strcmp(s, "gemm-perrow-error")) return scenario(200, 32, 1, "k_q8_gemm");
+  if (!std::strcmp(s, "gdn-quant-error")) return spineScenario(10240, 5120, 128, 32, "k_q8_quant_act");
+  if (!std::strcmp(s, "gdn-gemm-error")) return spineScenario(5120, 6144, 512, 32, "k_q8_gemm_rowtile");
   return 2;
 }
 `
