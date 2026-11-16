@@ -300,8 +300,8 @@ __global__ void k_qwen38_causal_attention_panel_hd256(
   }
 }
 
-// ---- Split-KV chunked-prefill panel (vLLM merge_attn_states borrow) --------------
-// ADAPT of vllm-project/vllm csrc/attention/merge_attn_states.cu:18 at
+// ---- Split-KV chunked-prefill panel (vLLM split-KV merge borrow) -----------------
+// ADAPT of vllm-project/vllm csrc/attention/merge_attn_states.cu at
 // ae065918640a198a56f6f17eb45e251c3229fe41 (Apache-2.0; notice at
 // third_party/vllm-merge-attn-states/NOTICE): rows whose prefix exceeds
 // QWEN38_SPLITKV_PREFIX_THRESHOLD split their causal KV range into at most
@@ -319,6 +319,16 @@ __global__ void k_qwen38_causal_attention_panel_hd256(
 // threshold and the launcher takes the unchanged path. Complementary to the P-05
 // MMA verdict (fattn_mma_hd256.cuh): when the tensor-core arm is selected and
 // available it still owns the panel; split-KV parallelizes only the SIMT arm.
+// SW stage attribution (ticket prefill-longprompt-scaling-p2048-20261108, [SW-VERIFIED],
+// internal/compute/prefill_attribution.go): causal attention over the growing context on
+// the full-attention layers is the ONLY superlinear P-term of the cold panel prefill;
+// its intrinsic O(P^2) FLOPs are <2% of total work at P2048, so the measured P512->P2048
+// decay is this kernel's byte amplification + serial per-key scan, not raw FLOPs. This
+// gate keys on CACHED prefix only, so a cold panel (prefix == 0) takes nsplits = 1 and no
+// key-range parallelism even at long P — extending it to prefix + tokens would change
+// live-path behavior and capture semantics (scratch growth) without an HW witness, which
+// the perf doctrine does not allow; the levers (this gate, the MMA default below, bf16 KV)
+// are HW-verdict-gated. Receipt: fak-private docs/notes/PREFILL-P2048-STAGE-ATTRIBUTION-2026-11-12.md.
 #define QWEN38_SPLITKV_PREFIX_THRESHOLD 1024
 #define QWEN38_SPLITKV_MAX_PARTITIONS 4
 static int qwen38_splitkv_partitions(int prefix, int tokens) {

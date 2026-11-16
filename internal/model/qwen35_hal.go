@@ -159,6 +159,7 @@ func (e *Qwen35QKNormResidencyError) Error() string {
 
 type qwen35HALState struct {
 	mu                  sync.Mutex
+	hostMetadata        *qwen35HostMetadata
 	backend             Qwen35GDNBackend
 	layers              []qwen35HALLayerState
 	sequenceBackend     Qwen35GDNPreprojectedSequenceBackend
@@ -609,6 +610,7 @@ func (q *qwen35HALState) free(backend compute.Backend) {
 		return
 	}
 	q.mu.Lock()
+	q.hostMetadata = nil
 	releases := make([]qwen35HALLayerRelease, 0, len(q.layers))
 	for i := range q.layers {
 		if release, last := q.layers[i].detach(backend); last {
@@ -1422,27 +1424,50 @@ func (s *Session) LastQSAScratchBytes() (int64, bool) {
 	return s.qwen35HAL.lastQSAScratchBytes, true
 }
 
+// ReserveHALKVEpisode pre-reserves this session's growable device KV for the
+// remaining decode episode: up to maxNew further positions appended on top of
+// the current KV length. Cohort formation calls it once per lane so the
+// episode's batched steps pay no mid-episode chunk-growth reallocation/copy -
+// the per-lane regrow that serialized the lanes=8 step behind the device lock.
+// It reports whether the backend accepted the reservation; backends without
+// the capability, and a refused reservation, leave the per-step reservation as
+// the backstop. The target only ever grows, so a mid-episode re-formation
+// re-reserving the same lane is a capacity no-op that still reports accepted.
+func (s *Session) ReserveHALKVEpisode(maxNew int) bool {
+	if s == nil || maxNew <= 0 || s.Backend == nil || s.halKV == nil || s.M == nil {
+		return false
+	}
+	if !s.M.Cfg.IsQwen35Hybrid() {
+		return false
+	}
+	r, ok := s.Backend.(compute.Qwen35SequenceKVReserveBackend)
+	if !ok {
+		return false
+	}
+	return r.Qwen35ReserveSequenceKV(s.halKV, maxNew) == nil
+}
+
 func (s *Session) qwen35SequencePrefillRequestWithEmbedding(ids []int, needLogits bool, embedding compute.Tensor, embeddingRows bool, embeddingVocab int) compute.Qwen35SequencePrefillRequest {
 	// Verification builds with NeedLogits=false and sets NeedAllLogits later.
 	// Preserve its complete request; only the admitted prefix caller opts out.
 	return s.qwen35SequencePrefillRequestWithOutput(ids, needLogits, embedding, embeddingRows, embeddingVocab, true)
 }
 
-func (s *Session) qwen35SequencePrefillRequestWithOutput(ids []int, needLogits bool, embedding compute.Tensor, embeddingRows bool, embeddingVocab int, includeOutput bool) compute.Qwen35SequencePrefillRequest {
+// buildQwen35HostMetadata builds the stable per-session half of a sequence
+// prefill request: weight descriptors and geometry that do not change between
+// requests. Per-request fields (tokens, position, KV, embedding, logits,
+// capture, output head) are filled by qwen35SequencePrefillRequestWithOutput
+// over the cached template.
+func (s *Session) buildQwen35HostMetadata() compute.Qwen35SequencePrefillRequest {
 	cfg := s.M.Cfg
 	nK, nV, kHd, vHd, _, _, _ := cfg.linearAttnDims()
 	req := compute.Qwen35SequencePrefillRequest{
-		Path: compute.Qwen35SequencePrefillPath, TokenIDs: append([]int(nil), ids...), StartPos: s.halKV.Len(),
-		TokenEmbedding: embedding, TokenEmbeddingRows: embeddingRows, TokenEmbeddingVocab: embeddingVocab,
+		Path:       compute.Qwen35SequencePrefillPath,
 		OutputNorm: s.normWeightHAL("model.norm.weight"),
-		Layers:     make([]compute.Qwen35SequenceLayer, cfg.NumLayers), States: make([]compute.Qwen35SequenceState, cfg.NumLayers), KV: s.halKV,
-		Hidden: cfg.HiddenSize, Intermediate: cfg.IntermediateSize, NumHeads: cfg.NumHeads, NumKVHeads: cfg.NumKVHeads,
+		Layers:     make([]compute.Qwen35SequenceLayer, cfg.NumLayers),
+		Hidden:     cfg.HiddenSize, Intermediate: cfg.IntermediateSize, NumHeads: cfg.NumHeads, NumKVHeads: cfg.NumKVHeads,
 		HeadDim: cfg.HeadDim, RotaryDim: cfg.rotaryDim(), NumKeyHeads: nK, NumValueHeads: nV, KeyHeadDim: kHd, ValueHeadDim: vHd,
-		ConvKernel: cfg.LinearConvKernelDim, RMSNormEpsilon: float32(cfg.RMSNormEps), RoPEThetaForLayer: make([]float64, cfg.NumLayers), NeedLogits: needLogits,
-		CaptureRawHidden: s.captureTargetHidden,
-	}
-	if includeOutput {
-		req.Output = s.lmHeadMatHAL()
+		ConvKernel: cfg.LinearConvKernelDim, RMSNormEpsilon: float32(cfg.RMSNormEps), RoPEThetaForLayer: make([]float64, cfg.NumLayers),
 	}
 	for l := 0; l < cfg.NumLayers; l++ {
 		req.RoPEThetaForLayer[l] = cfg.ropeThetaForLayer(l)

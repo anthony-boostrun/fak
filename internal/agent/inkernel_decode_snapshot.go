@@ -36,8 +36,8 @@ func inKernelSnapshotCheckpoint(matched, promptTokens int) int {
 // a warmup leaf) must not displace the deepest grid checkpoint: on the first request
 // of an agent loop that shallow boundary is the only one known, and spending the
 // checkpoint there left the second turn restoring 5 of 1922 shared tokens (#12742).
-// Adapted from oMLX's off-grid prefill-tail snapshots (Apache-2.0):
-// https://github.com/jundot/omlx/blob/8288884d9b4f6db7b547633a94d36794c6b1d52d/omlx/scheduler.py
+// Adapted from oMLX's off-grid prefill-tail snapshots (Apache-2.0, jundot/omlx
+// at 8288884d9b4f6db7b547633a94d36794c6b1d52d).
 func inKernelAdaptiveSnapshotCheckpoint(matched, cacheable, promptTokens int) int {
 	grid := inKernelSnapshotCheckpoint(matched, promptTokens)
 	if cacheable > matched && cacheable < promptTokens &&
@@ -52,16 +52,33 @@ func inKernelAdaptiveSnapshotCheckpoint(matched, cacheable, promptTokens int) in
 // when the snapshot byte budget refuses it the request proceeds without it instead
 // of failing, while the historical divergence/grid checkpoint keeps its contract.
 func (p *InKernelPlanner) admitPrefillCheckpoint(ctx context.Context, s *model.Session, prefix []int, logits []float32, optional bool) error {
+	captureAt, captureArmed := p.radixAttrBegin()
 	snap, err := s.PrefixSnapshot()
 	if err != nil {
 		return err
 	}
+	var snapBytes int64
+	if captureArmed {
+		snapBytes = snap.ResidentBytes()
+	}
+	evBefore := p.radixEvictions()
+	insertAt, insertArmed := p.radixAttrBegin()
 	if err := p.admitPrefixSnapshot(ctx, prefix, snap, logits); err != nil {
 		snap.Close()
 		if optional && errors.Is(err, radixkv.ErrSnapshotByteBudget) {
 			return nil
 		}
+		if captureArmed || insertArmed {
+			p.radixAttrRecord("checkpoint", len(prefix), 0, "miss", 0,
+				nsSince(captureAt, captureArmed), nsSince(insertAt, insertArmed),
+				snapBytes, radixLogitsBytes(logits), false, p.radixEvictions()-evBefore)
+		}
 		return err
+	}
+	if captureArmed || insertArmed {
+		p.radixAttrRecord("checkpoint", len(prefix), 0, "miss", 0,
+			nsSince(captureAt, captureArmed), nsSince(insertAt, insertArmed),
+			snapBytes, radixLogitsBytes(logits), false, p.radixEvictions()-evBefore)
 	}
 	return nil
 }
@@ -96,16 +113,28 @@ func (p *InKernelPlanner) admitGeneratedContinuation(ctx context.Context, s *mod
 		return
 	}
 	if p.backend != nil {
+		captureAt, captureArmed := p.radixAttrBegin()
 		snap, err := s.PrefixSnapshot()
 		if err != nil {
 			return
+		}
+		var snapBytes int64
+		if captureArmed {
+			snapBytes = snap.ResidentBytes()
 		}
 		if ctx.Err() != nil || snap.Tokens != len(tokens) {
 			snap.Close()
 			return
 		}
+		evBefore := p.radixEvictions()
+		insertAt, insertArmed := p.radixAttrBegin()
 		if err := p.admitPrefixSnapshot(ctx, tokens, snap, logits); err != nil {
 			snap.Close()
+		}
+		if captureArmed || insertArmed {
+			p.radixAttrRecord("continuation-snapshot", len(tokens), 0, "miss", 0,
+				nsSince(captureAt, captureArmed), nsSince(insertAt, insertArmed),
+				snapBytes, radixLogitsBytes(logits), false, p.radixEvictions()-evBefore)
 		}
 		return
 	}
@@ -122,11 +151,7 @@ func (p *InKernelPlanner) admitGeneratedContinuation(ctx context.Context, s *mod
 		_ = p.scopedTree.AdmitPrivate(owner, tokens, s.Cache, logits)
 		return
 	}
-	p.mu.Lock()
-	b, matched := p.tree.Lookup(tokens)
-	leaf := p.tree.InsertCloneWithLogits(b, tokens[matched:], s.Cache, logits)
-	p.tree.Done(leaf)
-	p.mu.Unlock()
+	p.admitCPUPayload("continuation", tokens, s, logits)
 }
 
 func (p *InKernelPlanner) sessionFromPrefixClone(prefix *model.KVCache) *model.Session {

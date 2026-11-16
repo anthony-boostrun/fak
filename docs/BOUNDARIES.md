@@ -43,6 +43,7 @@ path").
 | Dev-tooling CWD rule (companion dev harness) | [architecture/companion-dev-harness.md](architecture/companion-dev-harness.md) |
 | GPU/lab slice: what stays private | [gpu-server-private-boundary.md](gpu-server-private-boundary.md) |
 | Lab access: the public pointer into the private channel | [private-comms-channel.md](private-comms-channel.md) |
+| Consumer tier: the private downstream consumer + import DAG | `fak-private` `BOUNDARY.md` §1.3 (private; this page routes to it, §10) |
 
 Point, don't duplicate: each doc owns its slice; this page only routes.
 
@@ -125,7 +126,15 @@ Every guard refusal names a token from the closed `[reasons.*]` vocabulary in
 
 Full protocol: [AGENTS.md](../AGENTS.md), "If the kernel refuses you".
 
-## 10. Change protocol for this page
+## 10. The consumer tier
+
+A third, private consumer repo sits downstream of both `fak` (this repo) and
+`fak-private` in a one-way, acyclic import DAG. The concrete consumer, its name,
+and the full import-DAG table are documented in the private repo (`fak-private`),
+`BOUNDARY.md` §1.3; this page routes to it and does not duplicate it. No consumer
+code, IP, or secrets land here.
+
+## 11. Change protocol for this page
 
 New boundaries land here in the same commit as the boundary itself: when a doc takes
 ownership of a slice, a surface freezes, or a generated path appears, update the matching

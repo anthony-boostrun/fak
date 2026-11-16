@@ -383,7 +383,19 @@ type BudgetExhaustedFunc func(ctx context.Context, st SessionState, messages []a
 // Server is a configured, ready-to-serve gateway. Construct with New; serve with
 // Handler()/ListenAndServe (HTTP) or ServeStdio (MCP over stdin/stdout).
 type Server struct {
+	// usageLedger is the billing-grade per-request usage ledger (#14451), keyed
+	// on the authenticated principal; nil = off (request path unchanged).
+	usageLedger      atomic.Pointer[UsageLedger]
 	causalEmbeddings *causalEmbeddingProvider
+	// embeddingsUpstream is the proxy-mode /v1/embeddings forward target (#14444):
+	// non-nil only when an upstream is configured AND the operator did not opt
+	// into the hash backend. nil = no forwarding (offline deployment, or the
+	// explicit hash opt-in below).
+	embeddingsUpstream *embeddingsUpstream
+	// embeddingsHashOptIn mirrors Config.EmbeddingsBackend=="hash": hash-backend
+	// responses self-label as synthetic (model fak-hash-embed plus
+	// X-Fak-Embedding-Mode: hash) instead of carrying the configured chat model.
+	embeddingsHashOptIn bool
 	// prefixReuse attributes in-kernel prefix reuse to same- vs cross-session origin
 	// (prefix_reuse_attribution.go). Zero value is ready.
 	prefixReuse                  prefixReuseAttribution
@@ -475,6 +487,7 @@ type Server struct {
 	metalMTPCoord           *model.MetalMTPCoordinator
 	servedFailure           servedFailure // recent served-turn panic behind /healthz honesty (#2336); see served_failure.go
 	traceSeq                uint64        // mints a non-empty TraceID when the wire omits one (atomic)
+	traceIdentity           string        // per-replica identity inside minted gw-* ids (#14445); fixed in New, empty on a bare Server
 	reloadPolicy            PolicyReloadFunc
 	policyCanaryTurns       int
 	policyCanaryMu          sync.Mutex
@@ -731,8 +744,13 @@ type Server struct {
 	ctxValueMu sync.Mutex
 	ctxValue   map[string]*sessionCtxValue
 
+	// researchArmsMu guards researchArms and armAdmitWait. armAdmitWait is how long a
+	// proxied request may queue at a saturated research-arm concurrency limit before
+	// the 429 (0 = legacy immediate refusal); cmd/fak serve sets it from the
+	// --arm-admit-wait flag. See AdmitWithWait in internal/researcharm.
 	researchArmsMu sync.RWMutex
 	researchArms   *researcharm.Coordinator
+	armAdmitWait   time.Duration
 
 	// ctxExpenseWarn / ctxExpenseBlock are the effective per-turn as-sent-volume lines the
 	// context-expense verdict (ctxexpense.go) grades on, in ESTIMATED tokens (0 = that tier

@@ -61,17 +61,27 @@ type LeaseInfo struct {
 
 // ArmInfo provides an aggregated view of a research project arm's traffic and state.
 type ArmInfo struct {
-	ID             string     `json:"id"`
-	Group          string     `json:"group"`
-	DisplayName    string     `json:"display_name"`
-	MaxConcurrency int        `json:"max_concurrency"` // 0 = unlimited
-	ActiveRequests int        `json:"active_requests"`
-	TotalRequests  int64      `json:"total_requests"`
-	TotalTokens    int64      `json:"total_tokens"`
-	ErrorCount     int64      `json:"error_count"`
-	RecentPIDs     []int      `json:"recent_pids,omitempty"`
-	LastSeen       time.Time  `json:"last_seen"`
-	ActiveLease    *LeaseInfo `json:"active_lease,omitempty"`
+	ID              string `json:"id"`
+	Group           string `json:"group"`
+	DisplayName     string `json:"display_name"`
+	MaxConcurrency  int    `json:"max_concurrency"` // 0 = unlimited
+	ActiveRequests  int    `json:"active_requests"`
+	WaitingRequests int    `json:"waiting_requests,omitempty"`
+
+	// Admission-queue accounting (saturation.go): how many requests entered the queue,
+	// how many of those were admitted after waiting, how many were shed for CAPACITY, and
+	// the measured average wait behind the Retry-After hint.
+	WaitedTotal       int64         `json:"waited_total,omitempty"`
+	AdmittedAfterWait int64         `json:"admitted_after_wait,omitempty"`
+	ShedsTotal        int64         `json:"sheds_total,omitempty"`
+	AvgQueueWait      time.Duration `json:"avg_queue_wait,omitempty"`
+
+	TotalRequests int64      `json:"total_requests"`
+	TotalTokens   int64      `json:"total_tokens"`
+	ErrorCount    int64      `json:"error_count"`
+	RecentPIDs    []int      `json:"recent_pids,omitempty"`
+	LastSeen      time.Time  `json:"last_seen"`
+	ActiveLease   *LeaseInfo `json:"active_lease,omitempty"`
 }
 
 // InflightRequest describes a single request currently being served.
@@ -90,13 +100,14 @@ type InflightRequest struct {
 
 // Snapshot is the comprehensive state of all arms, active traffic, and leases.
 type Snapshot struct {
-	DurableStatus string            `json:"durable_status,omitempty"` // ready, bootstrap, closed, or unavailable.
-	Timestamp     time.Time         `json:"timestamp"`
-	TotalInflight int               `json:"total_inflight"`
-	TotalArms     int               `json:"total_arms"`
-	Arms          []ArmInfo         `json:"arms"`
-	Inflight      []InflightRequest `json:"inflight"`
-	ActiveLeases  []LeaseInfo       `json:"active_leases"`
+	DurableStatus         string            `json:"durable_status,omitempty"` // ready, bootstrap, closed, or unavailable.
+	Timestamp             time.Time         `json:"timestamp"`
+	TotalInflight         int               `json:"total_inflight"`
+	TotalArms             int               `json:"total_arms"`
+	DefaultMaxConcurrency int               `json:"default_max_concurrency"` // ceiling a newly registered arm inherits (0 = unlimited)
+	Arms                  []ArmInfo         `json:"arms"`
+	Inflight              []InflightRequest `json:"inflight"`
+	ActiveLeases          []LeaseInfo       `json:"active_leases"`
 }
 
 // LeaseRequest specifies parameters for acquiring or renewing a lease.

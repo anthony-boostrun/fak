@@ -245,7 +245,7 @@ SCORECARDS: list[dict[str, str]] = [
     {"key": "sota", "debt": "sota_debt", "script": "sota_coverage_scorecard.py", "label": "sota-coverage"},
     {"key": "agent", "debt": "friction_debt", "script": "", "cmd": "go run ./cmd/fak score agent-readiness --json", "label": "agent-readiness"},
     {"key": "brittleness", "debt": "brittleness_debt", "script": "", "cmd": "go run ./cmd/fak score brittleness --json", "label": "brittleness"},
-    {"key": "product", "debt": "product_debt", "script": "product_scorecard.py", "label": "product"},
+    {"key": "product", "debt": "product_debt", "script": "", "cmd": "go run ./cmd/fak product-scorecard --json", "label": "product"},
     {"key": "persona", "debt": "persona_debt", "script": "persona_readiness_scorecard.py", "label": "persona"},
     {"key": "popularization", "debt": "popularization_debt", "script": "popularization_readiness_scorecard.py", "label": "popularization"},
     {"key": "stability", "debt": "stability_debt", "script": "stability_scorecard.py", "label": "stability"},
@@ -298,6 +298,7 @@ SCORECARDS: list[dict[str, str]] = [
     # unbounded drift number operators watch over time.
     {"key": "heaviness", "debt": "heaviness_debt", "script": "", "cmd": "go run ./cmd/fak operator heaviness --json", "label": "operator-heaviness"},
     {"key": "propagation", "debt": "propagation_debt", "script": "", "cmd": "go run ./cmd/fak propagation-scorecard --json", "label": "propagation"},
+    {"key": "checkpoint", "debt": "checkpoint_debt", "script": "", "cmd": "go run ./cmd/fak checkpoint-scorecard --json", "label": "checkpoint"},
     {"key": "claim_repro", "debt": "claim_repro_debt", "script": "claim_repro_scorecard.py", "label": "claim-repro"},
     {"key": "release", "debt": "release_debt", "script": "release_readiness_scorecard.py", "label": "release-readiness"},
     # Folded #1270: these emit a control-pane-compatible payload (corpus.*_debt +
@@ -352,6 +353,11 @@ EXCLUDED_SCORECARDS: dict[str, str] = {
     "commit_quality_scorecard.py": (
         "eventual commit-scoring superset; folding beside commit_subject would "
         "double-count that KPI until its clean-tree migration lands"
+    ),
+    "product_scorecard.py": (
+        "superseded by the Go-native port (internal/productscorecard, `fak product-scorecard`); "
+        "retained only as the docs/product-scorecard generator + reference binding, no longer "
+        "the registered control-pane runner"
     ),
 }
 

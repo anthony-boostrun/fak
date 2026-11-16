@@ -15,6 +15,7 @@ import (
 	"github.com/anthony-chaudhary/fak/internal/cacheobs"
 	"github.com/anthony-chaudhary/fak/internal/compactcohere"
 	"github.com/anthony-chaudhary/fak/internal/metrics"
+	"github.com/anthony-chaudhary/fak/internal/model"
 	"github.com/anthony-chaudhary/fak/internal/nativeperf"
 	"github.com/anthony-chaudhary/fak/internal/perfledger"
 	"github.com/anthony-chaudhary/fak/internal/vcacheobserve"
@@ -914,6 +915,16 @@ func upstreamErrorKind(err error) string {
 		}
 		return "status_5xx"
 	}
+	// A fail-closed device-stage failure (a *model.BackendForwardOperationError, e.g. the V4.1
+	// mHC pre-collapse readback at a specific layer) is a LOCAL in-kernel engine fault, not an
+	// upstream provider failure. It is in-kernel by construction, so it gets its OWN kind —
+	// distinct from the coarse "other" bucket and from "oom" — so a /metrics scrape (and the
+	// FAILED debug line) can tell a device-stage fault storm apart from everything else. Stays
+	// in lockstep with upstreamErrorStatus's in_kernel_device_stage_failed arm (#3518).
+	var bfo *model.BackendForwardOperationError
+	if errors.As(err, &bfo) {
+		return "device_stage"
+	}
 	// A TRANSIENT transport failure (mid-flight reset, truncated read, I/O timeout) that
 	// exhausted the planner's in-handler retry and surfaced to the wrapped agent. Split from
 	// the coarse "other" bucket so `fak guard`'s supervisor has a specific signal for a wire
@@ -1444,6 +1455,17 @@ func (s *Server) logInferenceTurn(traceID, wire string, stream bool, usage agent
 	s.logInferenceTurnWithContextEvent(traceID, wire, stream, usage, finishReason, dur, compacted, compacted || s.consumeDecodedCtxViewEvent(traceID))
 }
 
+// logInferenceTurnAs is the principal-aware funnel entry (#14451): a route that
+// holds the request context passes the authenticated keyset principal stamped
+// by withAuth so the usage ledger keys the row on the presenting key, never on
+// a client-chosen trace or header.
+func (s *Server) logInferenceTurnAs(traceID, wire string, stream bool, usage agent.Usage, finishReason string, dur time.Duration, compacted, contextEvent bool, principal string) {
+	if s == nil {
+		return
+	}
+	s.logInferenceTurnForModelAs(traceID, wire, s.model, stream, usage, finishReason, dur, compacted, contextEvent, principal)
+}
+
 func (s *Server) logInferenceTurnWithContextEvent(traceID, wire string, stream bool, usage agent.Usage, finishReason string, dur time.Duration, compacted, contextEvent bool) {
 	if s == nil {
 		return
@@ -1454,6 +1476,12 @@ func (s *Server) logInferenceTurnWithContextEvent(traceID, wire string, stream b
 // logInferenceTurnForModel records an explicitly selected upstream model while
 // the wire response can retain the client's public model alias.
 func (s *Server) logInferenceTurnForModel(traceID, wire, model string, stream bool, usage agent.Usage, finishReason string, dur time.Duration, compacted, contextEvent bool) {
+	s.logInferenceTurnForModelAs(traceID, wire, model, stream, usage, finishReason, dur, compacted, contextEvent, "")
+}
+
+// logInferenceTurnForModelAs is the shared per-turn chokepoint with the
+// authenticated principal threaded through for the usage ledger (#14451).
+func (s *Server) logInferenceTurnForModelAs(traceID, wire, model string, stream bool, usage agent.Usage, finishReason string, dur time.Duration, compacted, contextEvent bool, principal string) {
 	if s == nil {
 		return
 	}
@@ -1490,6 +1518,11 @@ func (s *Server) logInferenceTurnForModel(traceID, wire, model string, stream bo
 	// The stable per-request usage record (#10670): exactly one row per
 	// completed request, after the native plane above so its join receipts exist.
 	usageRec, usageRecOK := s.metrics.recordUsageTurn(traceID, wire, stream, usage, nowMillis)
+	// The billing-grade per-request usage ledger (#14451): one durable
+	// hash-chained row per request, keyed on the authenticated principal when
+	// the route carried one. Purely observational: a nil ledger or an append
+	// failure never touches the request path.
+	s.appendUsageLedgerRow(traceID, wire, model, usage, nowMillis, finishReason, principal)
 	// Roll the per-session managed-context record (ctxvalue.go) on the same always-on
 	// rung: every served turn, all wires, before any sink gating, so the long-session
 	// context report is answerable even with --log and --debug-stats off.

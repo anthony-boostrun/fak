@@ -470,6 +470,10 @@ func dispatchCoreVerbB(name string, args []string) bool {
 		cmdServe(args)
 	case "serve-wiring":
 		cmdServeWiring(args)
+	case "serve-receipt":
+		// Issue #14362: on-demand model→GPU serving-config receipts
+		// (plan / validate / profiles) over internal/servereceipt.
+		cmdServeReceipt(args)
 	case "l3-serve", "l3serve":
 		cmdL3Serve(args)
 	case "manage", "m":
@@ -902,6 +906,11 @@ func dispatchExtendedVerbB(name string, args []string) bool {
 		// in cmd/fak because release archives ship ONLY this binary — the
 		// release gate runs the extracted binary's own registry, not the tree's.
 		os.Exit(runBackends(os.Stdout, os.Stderr, args))
+	case "keys":
+		// The billing key + unit-ledger operator surface (PLAN-C Phase 3 item 11,
+		// ticket bm-p3-11-keyscli): `fak keys mint|topup|balance|revoke|list` over
+		// pkg/billing/keystore + pkg/billing/ledger, located via --manifest's state_dir.
+		cmdKeys(args)
 	case "-h", "--help", "help":
 		cmdHelp(args)
 	default:

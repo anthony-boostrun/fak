@@ -301,6 +301,17 @@ type Config struct {
 	// EmbeddingPooling explicitly selects bounded learned CPU causal mean/last embeddings.
 	// Empty preserves the legacy hash endpoint. Unsupported selections fail at startup.
 	EmbeddingPooling string
+	// EmbeddingsBackend selects the /v1/embeddings backend posture for proxy
+	// deployments (#14444). Empty (default) keeps the split honest: with an upstream
+	// configured (BaseURL or ReplicaBaseURLs), requests forward to that upstream's
+	// OpenAI-compatible /embeddings endpoint and a provider that cannot serve one
+	// (no such route, transport failure, or any non-2xx) answers 501 with the typed
+	// code embeddings_backend_unwired; offline deployments keep the deterministic
+	// hashing backend byte-for-byte. "hash" opts the deployment IN to the hashing
+	// backend even in front of an upstream: its responses then self-label as
+	// synthetic (model fak-hash-embed plus X-Fak-Embedding-Mode: hash) instead of
+	// masquerading under the configured chat model. Any other value fails New loud.
+	EmbeddingsBackend string
 	// Adjudicators optionally supplies a complete per-server kernel chain. A nil
 	// chain preserves the registered pipeline; callers must retain every floor.
 	Adjudicators []abi.Adjudicator
@@ -749,6 +760,12 @@ type Config struct {
 	// value lets wrapped CLIs that do not expose trace headers still share one
 	// operator-addressable session budget.
 	DefaultTraceID string
+	// TraceIdentity is the per-replica identity embedded in every gateway-minted gw-*
+	// trace id (#14445): with N replicas behind one service, two live replicas must
+	// never mint the same id, and a trace should be attributable to the pod that
+	// served it. Empty (the default) mints one at New from POD_NAME / the host name
+	// plus a random nonce; set it explicitly for deterministic tests.
+	TraceIdentity string
 	// MCPSessionBearer authenticates that POST /mcp came from the child configured by
 	// this guard launch. It deliberately grants no workspace lease ownership: the
 	// current DOS authority has no server-authenticated binding from a launch to a row.
