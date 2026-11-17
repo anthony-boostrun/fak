@@ -92,3 +92,56 @@ state passes — and the merge receipt says so.
   parse on diagram docs; demo boot smoke (loopback bind, unkeyed act refused).
 - All run in a session-private clone of the three-repo workspace, 2026-11-17.
 - Merge receipts: the merge-commit bodies of the five PRs that session landed.
+
+## Round-2 addendum (same day; four more PRs through the same pipeline)
+
+The six-line framework ran again hours later on a second batch — four PRs,
+all landed by the review session — and held. Six new lessons, continuing the
+stack rank:
+
+7. **A PR's visible commit list is computed against its stacked base, not the
+   default branch.** A docs-labeled PR showed one commit; the merge actually
+   carried four, including an unlabeled gate implementation (a command, a
+   library, a CI job). The branch was stacked on another unmerged branch, so
+   the forge counted commits from the stack base. **Rule: review what merges,
+   not what the label shows** — enumerate `git log <default>..<head>` yourself
+   and treat a label/content mismatch as a finding. The smuggled code was
+   reviewed as code (its own behavior witnesses + `-race`), and the merge
+   receipt records what actually arrived.
+8. **The same gap can be fixed twice by parallel lanes; judge the second PR
+   against the LANDED state, not the original ticket.** One gap was
+   implemented twice with different architectures. The naive union of both
+   did not compile (duplicate symbols; new code referencing the other side's
+   constants — verified by building the union in a scratch module), and
+   wholesale replacement would have silently dropped several fail-closed
+   protections of the landed gate. **Resolution: superset integration** —
+   keep the landed implementation, take the newcomer's scanner with
+   constants reconciled, wire it into the production entry point as a
+   strictly additive layer (deduplicated against the existing layer's
+   findings), keep the newcomer's pure unit tests, and add wiring witnesses
+   in both directions (a violation only the new layer can see is caught; a
+   legal edge is neither flagged twice nor falsely). **Rules: build the
+   naive union before choosing a resolution; integration without wiring is
+   dead code; a test that bakes in weaker semantics than the landed gate
+   gets reconciled, not inherited.**
+9. **A clean auto-merge can silently drop content.** When a PR's branch has
+   already merged the default branch, a file's "ours" side equals the merge
+   base, so git takes theirs wholesale — here silently dropping receipt
+   lines only the base had. Caught by diffing the staged resolution against
+   both parents. **Rule: after any auto-merge, diff the staged result
+   against BOTH parents for every file the PR touches; when both sides
+   carry facts, resolve to the union.**
+10. **A branch that moves mid-review invalidates its witnesses.** Pin the
+    head SHA you witnessed; re-run the gates when it moves.
+11. **The forge's "merged" flag can lag the actual merge.** Prove the merge
+    yourself (`git merge-base --is-ancestor <head> <default>`) and record
+    that proof; do not close the PR — closed ≠ merged.
+12. **The infra-red carve-out held under repetition:** a second PR's UNSTABLE
+    check had the same billing-blocked-runner cause; every gate reproduced
+    green locally; landed with the explanation in the merge receipt.
+
+Round-2 merge receipts: the merge-commit bodies of the four merges (each
+carries the stages run, the conflict-resolution note, and the per-run landing
+authorization). Post-landing state: build/vet/format clean, the boundary
+check clean with the new additive layer live, full test suite ok, `-race`
+clean, leak-scrub clean on every merged range.
