@@ -372,7 +372,12 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 // its own listener and calls Serve directly. It mirrors net/http.Server's
 // ListenAndServe/Serve split.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	drainTimeout := parseHTTPDrainTimeout(os.Getenv("FAK_HTTP_DRAIN_TIMEOUT_S"))
+	// The drain deadline derives from the SAME write timeout the handlers run
+	// under, so an in-flight stream that legitimately runs up to WriteTimeout
+	// finishes instead of being cut by a fixed 5s on every rolling update
+	// (#14454). FAK_HTTP_DRAIN_TIMEOUT_S still overrides either way.
+	writeTimeout := durEnv("FAK_HTTP_WRITE_TIMEOUT_S", serveWriteTimeoutDefault(plannerKind(s.planner)))
+	drainTimeout := parseHTTPDrainTimeout(os.Getenv("FAK_HTTP_DRAIN_TIMEOUT_S"), defaultHTTPDrainTimeout(writeTimeout))
 	// Record the address we actually bound so a served descriptor can name this
 	// process instead of a literal (#5642). This is the ONLY point where the chosen
 	// address is known — with an ephemeral ":0" bind the port does not exist until
@@ -399,7 +404,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       durEnv("FAK_HTTP_READ_TIMEOUT_S", 30*time.Second),
-		WriteTimeout:      durEnv("FAK_HTTP_WRITE_TIMEOUT_S", serveWriteTimeoutDefault(plannerKind(s.planner))),
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       durEnv("FAK_HTTP_IDLE_TIMEOUT_S", 120*time.Second),
 		// Route net/http's own diagnostics (per-request panic recovery, TLS/keepalive
 		// errors) through the SAME sink as every other gateway log. Left nil, net/http
@@ -470,14 +475,26 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-const defaultHTTPDrainTimeout = 5 * time.Second
+// defaultHTTPDrainTimeout derives the graceful-shutdown deadline from the handler
+// write timeout, so an in-flight stream that legitimately runs up to WriteTimeout
+// finishes instead of being cut by a fixed 5s on every rolling update (#14454).
+// The +10s settle covers the tail of chunked delivery after the last token. A zero
+// write timeout - a local in-kernel model whose turn can run for minutes - gets
+// the longer floor; operators with multi-minute decodes raise
+// FAK_HTTP_DRAIN_TIMEOUT_S explicitly.
+func defaultHTTPDrainTimeout(writeTimeout time.Duration) time.Duration {
+	if writeTimeout <= 0 {
+		return 120 * time.Second
+	}
+	return writeTimeout + 10*time.Second
+}
 
 // parseHTTPDrainTimeout accepts positive whole seconds that fit in a Duration.
-// Invalid values retain the default so shutdown always has a finite deadline.
-func parseHTTPDrainTimeout(raw string) time.Duration {
+// Unset or invalid values retain def so shutdown always has a finite deadline.
+func parseHTTPDrainTimeout(raw string, def time.Duration) time.Duration {
 	n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil || n <= 0 || n > int64((1<<63-1)/time.Second) {
-		return defaultHTTPDrainTimeout
+		return def
 	}
 	return time.Duration(n) * time.Second
 }
@@ -570,9 +587,20 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			authed := ok && s.requireKey != "" && subtle.ConstantTimeCompare(got[:], want[:]) == 1
 			principal := ""
 			if ok {
-				if p, matched := s.keyset.lookup(tok); matched {
+				if p, sc, matched := s.keyset.lookupScoped(tok); matched {
 					authed = true
 					principal = p
+					// Per-key scope enforcement (#14448): a tenant key without the
+					// admin scope may not reach the host-wide operator plane — policy
+					// / route reload, control directives, revoke, /v1/admin/* — which
+					// answers 403 scope_forbidden here, before any handler runs. Every
+					// other route stays tenant-reachable (the inference wire plus the
+					// tenant self-service surface, #14442), and the RequireKey operator
+					// door stays unscoped on every route.
+					if sc&keyScopeAdmin == 0 && operatorPlaneRoute(r.URL.Path) {
+						writeScopeForbidden(w, sc.token(), r.Method)
+						return
+					}
 				}
 			}
 			// The read-scoped bearer (Config.ReadBearer) is consulted only AFTER the
@@ -595,10 +623,23 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			}
 		} else if s.keyset != nil {
 			if tok, ok := gatewayCredential(r); ok {
-				if p, matched := s.keyset.lookup(tok); matched {
+				if p, _, matched := s.keyset.lookupScoped(tok); matched {
 					r = r.WithContext(WithPrincipal(r.Context(), p))
 				}
 			}
+		}
+		// Tenant floor for operator-grade observability (#14452): whatever the
+		// source address, a request that authenticated AS a named tenant principal
+		// (keyset-bound, stamped above on either branch) is refused on the
+		// operator surfaces — a tenant key must not open /metrics, /debug/vars,
+		// the observation family or /slots even from loopback. Operators scrape
+		// with the full gateway key, the dedicated metrics bearer, or on-box
+		// without any tenant credential; both doors authenticate WITHOUT a
+		// principal, so this check never touches them.
+		if p := principalFromContext(r.Context()); p != "" && operatorObservationPath(r.URL.Path) {
+			s.logf("gateway: tenant %q refused operator-scoped route %s", p, r.URL.Path)
+			writeErr(w, http.StatusForbidden, "operator-scoped route: tenant keys cannot read "+r.URL.Path+"; use the operator or metrics bearer")
+			return
 		}
 		if s.startup.childStartupPending() && strings.HasPrefix(r.URL.Path, "/v1/") && !strings.HasPrefix(r.URL.Path, "/v1/fak/") {
 			s.MarkChildUsable(time.Now())
@@ -696,6 +737,24 @@ func readScopedPath(r *http.Request) bool {
 		// /metrics here so the read-scoped floor cannot drift — an engine that
 		// admits /metrics must admit the introspection that explains it.
 		"/props", "/slots":
+		return true
+	}
+	return false
+}
+
+// operatorObservationPath reports whether the path is an OPERATOR-GRADE
+// observability surface (#14452): the process-wide /metrics and /debug/vars,
+// the observation family, and the engine-introspection /slots. These carry
+// other tenants' tool names, verdicts, trace ids and customer names, so they
+// stay closed to keyset-bound TENANT principals: the doors are the on-box
+// loopback exemption, the full-strength RequireKey bearer, and the dedicated
+// read-only metrics bearer (Config.ReadBearer, armed on `fak serve` via
+// --metrics-key-env). The set is deliberately NARROWER than readScopedPath —
+// /props, /v1/fak/perf/* and /v1/fak/arms* expose process-level counts and
+// build labels, not per-tenant content, and keep their read-scoped access.
+func operatorObservationPath(path string) bool {
+	switch path {
+	case "/metrics", "/debug/vars", "/v1/fak/observation", "/v1/fak/observation/requests", "/v1/fak/observation/engine", "/slots":
 		return true
 	}
 	return false
@@ -874,6 +933,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !admitted {
 		return
 	}
+	// Count a text-form tool call promoted into structured calls as a parse
+	// outcome, not just a log line. Installed on the handler ctx so both the
+	// buffered path and the live chat stream (called with this same ctx) inherit it.
+	ctx = s.withToolCallParseObserver(ctx)
 	sessionTurn.turnCost = newTurnCostRecord(req.Stream)
 	defer func() {
 		sessionTurn.complete()
@@ -1176,6 +1239,7 @@ func hasElidedToolResult(messages []agent.Message) bool {
 
 func (s *Server) validateChatCompletionConformance(w http.ResponseWriter, stream *chatStreamWriter, comp *agent.Completion, asst agent.Message, receiptRequested, decodeTraceRequested, decodeTokenIDsRequested bool, inputTriggerRoute *InputTriggerRouteReceipt) bool {
 	if comp.ToolCallsDropped && len(asst.ToolCalls) == 0 {
+		s.metrics.observeToolCallParse(toolCallParseOutcomeFailClosed, "", toolCallDropReasonName(comp))
 		s.logf("gateway: upstream announced tool_calls but none parsed (conformance fail-closed); model=%s reason=%s finish_reason=%s completion_tokens=%d", s.model, toolCallDropReasonName(comp), toolCallLogFinishReason(comp.FinishReason), comp.Usage.CompletionTokens)
 		if msg, code, typed := toolCallDropRefusal(comp); typed {
 			if stream != nil {
@@ -1192,6 +1256,8 @@ func (s *Server) validateChatCompletionConformance(w http.ResponseWriter, stream
 		}
 		writeErr(w, http.StatusBadGateway, conformanceMsg)
 		return false
+	} else if len(asst.ToolCalls) > 0 {
+		s.metrics.observeToolCallParse(toolCallParseOutcomeStructured, "", "")
 	}
 	if receiptRequested && comp.NativeInference == nil {
 		writeErr(w, http.StatusBadGateway, "configured planner cannot produce a native inference receipt")
